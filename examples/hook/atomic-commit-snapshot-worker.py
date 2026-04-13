@@ -47,12 +47,17 @@ Environment
 - OPENCODE_SNAPSHOT_IDLE_SECONDS      default: 30.0
 - OPENCODE_SNAPSHOT_INFLIGHT_TTL      default: 120.0
 - OPENCODE_SNAPSHOT_DEBUG             default: off
+- OPENAI_API_KEY                      default: unset (fallback to deterministic)
+- OPENAI_BASE_URL                     default: https://api.openai.com/v1
+- OPENAI_MODEL                        default: gpt-5.4-mini
+- OPENAI_API_TIMEOUT                  default: 15
+- OPENAI_STORE                        default: false
 
 Notes
 -----
-- This example intentionally uses deterministic commit messages for reliability
-  and speed. It can be extended later to use AI for message generation.
-- `rename` events are committed as one deterministic remove+add snapshot unit.
+- AI commit messages are attempted by default when OPENAI_API_KEY is set.
+- Deterministic commit messages remain the fallback for reliability.
+- `rename` events are committed as one snapshot unit.
 - The worker updates the checked-out branch ref directly via `git update-ref`
   using compare-and-swap semantics. The worktree/index are not rewritten.
 """
@@ -66,15 +71,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
-import signal
+import re
 import stat
 import subprocess
 import sys
-import tempfile
+import textwrap
 import time
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 SPOOL_ROOT = Path(
@@ -90,6 +96,29 @@ DEBUG_ENABLED = os.environ.get("OPENCODE_SNAPSHOT_DEBUG", "").lower() not in {
     "no",
 }
 DEBUG_LOG = Path("/tmp/opencode-atomic-snapshot.log")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+OPENAI_API_TIMEOUT = float(os.environ.get("OPENAI_API_TIMEOUT", "15"))
+OPENAI_STORE = os.environ.get("OPENAI_STORE", "false").lower() in {"1", "true", "yes"}
+
+SYSTEM_PROMPT = """You are a git commit message generator. Follow this format EXACTLY:
+
+Line 1: <imperative verb> <what changed> (max 50 chars, NO period)
+Line 2: blank
+Line 3+: <why/context as bullet points> (max 72 chars per line)
+
+Rules:
+- Line 1 MUST start with an imperative verb (Add, Fix, Refactor, Extract, Remove, Rename, Implement, Correct, Tighten, Wire, Improve, Update, Simplify, Introduce, Adjust, Harden, Restore)
+- Line 1 must describe WHAT changed semantically, not just the filename
+- Body explains WHY this change was made, not what lines changed
+- Use one bullet point per reason/context sentence
+- Start each new bullet point with "- "
+- Wrap body lines at 72 characters maximum
+- If a bullet point wraps, continuation lines must NOT start with "- "
+- NEVER use generic messages like "Update file", "WIP", "Fix stuff", "Modify code"
+- NEVER mention filenames in line 1 unless the change IS about the file itself (e.g. renaming it)
+- Output ONLY the commit message, nothing else
+- NEVER ask questions or request clarification. You must ALWAYS output a valid commit message."""
 
 
 def debug(message: str) -> None:
@@ -180,6 +209,10 @@ def json_load(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def json_bool(value: bool) -> bool:
+    return bool(value)
+
+
 def monotonic_now() -> float:
     return time.time()
 
@@ -216,6 +249,18 @@ def store_blob(repo_root: Path, abs_path: Path) -> Tuple[str, str]:
         return oid, mode
     oid = run_git(repo_root, "hash-object", "-w", str(abs_path))
     return oid, mode
+
+
+def blob_bytes(repo_root: Path, oid: Optional[str]) -> bytes:
+    if not oid:
+        return b""
+    return subprocess.run(
+        ["git", "cat-file", "-p", oid],
+        cwd=str(repo_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout
 
 
 def ls_tree_entry(
@@ -419,6 +464,205 @@ def deterministic_commit_message(entry: SnapshotEntry) -> str:
     return f"{title}\n\n{body}\n- Snapshot seq: {entry.seq}\n- Tool: {entry.tool_name or 'unknown'}"
 
 
+def decode_blob_text(data: bytes) -> Optional[str]:
+    if b"\x00" in data:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def snapshot_diff_text(repo_root: Path, entry: SnapshotEntry) -> str:
+    import difflib
+
+    change = entry.change
+    op = change["operation"]
+
+    if op == "create":
+        before_label = "/dev/null"
+        after_label = change["path"]
+        before_bytes = b""
+        after_bytes = blob_bytes(repo_root, change.get("blob_oid"))
+    elif op == "modify":
+        before_label = change["path"]
+        after_label = change["path"]
+        before_bytes = blob_bytes(repo_root, change.get("previous_blob_oid"))
+        after_bytes = blob_bytes(repo_root, change.get("blob_oid"))
+    elif op == "delete":
+        before_label = change["path"]
+        after_label = "/dev/null"
+        before_bytes = blob_bytes(repo_root, change.get("previous_blob_oid"))
+        after_bytes = b""
+    else:
+        before_label = change["from_path"]
+        after_label = change["to_path"]
+        before_bytes = blob_bytes(repo_root, change.get("old_blob_oid"))
+        after_bytes = blob_bytes(repo_root, change.get("new_blob_oid"))
+
+    before_text = decode_blob_text(before_bytes)
+    after_text = decode_blob_text(after_bytes)
+    if before_text is None or after_text is None:
+        return "<binary or non-text content changed>"
+
+    diff_lines = list(
+        difflib.unified_diff(
+            before_text.splitlines(),
+            after_text.splitlines(),
+            fromfile=before_label,
+            tofile=after_label,
+            lineterm="",
+            n=3,
+        )
+    )
+    if not diff_lines:
+        return "<no textual diff available>"
+    diff_text = "\n".join(diff_lines)
+    return diff_text[:4000]
+
+
+def ai_user_prompt(repo_root: Path, entry: SnapshotEntry) -> str:
+    change = entry.change
+    op = change["operation"]
+    diff_text = snapshot_diff_text(repo_root, entry)
+    tool_name = entry.tool_name or "unknown"
+
+    if op == "create":
+        subject = f"New file created: {change['path']}"
+        suffix = "Generate a commit message for this new file snapshot."
+    elif op == "modify":
+        subject = f"File edited: {change['path']}"
+        suffix = "Generate a commit message for this file snapshot edit."
+    elif op == "delete":
+        subject = f"File deleted: {change['path']}"
+        suffix = "Generate a commit message for this file deletion snapshot."
+    else:
+        subject = f"File renamed: {change['from_path']} -> {change['to_path']}"
+        suffix = "Generate a commit message for this file rename snapshot."
+
+    return (
+        f"{subject}\n\n"
+        f"Snapshot metadata:\n"
+        f"- relative_path: {change.get('path') or change.get('to_path') or change.get('from_path')}\n"
+        f"- operation: {op}\n"
+        f"- tool: {tool_name}\n"
+        f"- snapshot_seq: {entry.seq}\n\n"
+        f"Diff:\n{diff_text}\n\n"
+        f"{suffix}"
+    )
+
+
+def validate_commit_msg(msg: str) -> bool:
+    return not bool(
+        re.search(
+            r"(^(I |Could |Can |What |Why |Would |Should |Do |Is |Are |Please |It looks|I need|I cannot|I can.t|However|Unfortunately)|\?[\s]*$)",
+            msg,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def sanitize_commit_message(message: str) -> str:
+    raw_lines = [
+        line.rstrip() for line in message.splitlines() if line.strip() != "```"
+    ]
+    lines = [line for line in raw_lines if line.strip()]
+    if not lines:
+        return "Modify files"
+
+    subject = re.sub(r"^[\-*\s]+", "", lines[0]).strip().rstrip(".")
+    if not subject:
+        subject = "Modify files"
+    if len(subject) > 50:
+        subject = subject[:47].rstrip() + "..."
+
+    body_inputs: List[str] = []
+    current: Optional[str] = None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^[\-*]\s+", stripped):
+            cleaned = re.sub(r"^[\-*\s]+", "", stripped).strip()
+            if cleaned:
+                if current:
+                    body_inputs.append(current)
+                current = cleaned
+        else:
+            current = f"{current} {stripped}".strip() if current else stripped
+    if current:
+        body_inputs.append(current)
+
+    if not body_inputs:
+        return subject
+
+    wrapped: List[str] = []
+    for bullet in body_inputs:
+        wrapped.extend(
+            textwrap.wrap(
+                bullet,
+                width=72,
+                initial_indent="- ",
+                subsequent_indent="",
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+        )
+    return subject + "\n\n" + "\n".join(line[:72] for line in wrapped)
+
+
+def generate_ai_commit_message(repo_root: Path, entry: SnapshotEntry) -> Optional[str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        debug("OPENAI_API_KEY not set; using fallback commit message")
+        return None
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ai_user_prompt(repo_root, entry)},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.3,
+        "store": json_bool(OPENAI_STORE),
+    }
+
+    url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(req, timeout=OPENAI_API_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except (urllib_error.URLError, TimeoutError) as exc:
+        debug(f"AI commit message request failed: {exc}")
+        return None
+
+    try:
+        parsed = json.loads(raw)
+        content = parsed["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        debug(f"AI commit message response parse failed: {exc}")
+        return None
+
+    if not content or not validate_commit_msg(content):
+        debug("AI commit message failed validation")
+        return None
+    return sanitize_commit_message(content)
+
+
+def build_commit_message(repo_root: Path, entry: SnapshotEntry) -> str:
+    ai_msg = generate_ai_commit_message(repo_root, entry)
+    if ai_msg:
+        return ai_msg
+    return deterministic_commit_message(entry)
+
+
 def enqueue_from_payload(payload: Dict[str, Any]) -> int:
     event = payload.get("event")
     if event != "file.changed":
@@ -615,7 +859,7 @@ def build_commit(repo_root: Path, spool: Path, entry: SnapshotEntry) -> str:
         raise GitError(f"Unsupported operation: {op}")
 
     tree_oid = run_git(repo_root, "write-tree", env=env)
-    commit_message = deterministic_commit_message(entry)
+    commit_message = build_commit_message(repo_root, entry)
     commit_oid = run_git(
         repo_root,
         "commit-tree",
