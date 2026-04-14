@@ -58,8 +58,9 @@ Notes
 - AI commit messages are attempted by default when OPENAI_API_KEY is set.
 - Deterministic commit messages remain the fallback for reliability.
 - `rename` events are committed as one snapshot unit.
-- The worker updates the checked-out branch ref directly via `git update-ref`
-  using compare-and-swap semantics. The worktree/index are not rewritten.
+- Candidate commits are built on a hidden ref first.
+- The visible branch is only advanced when it is safe to publish.
+- Publishing rewrites only tracked paths and avoids unrelated repo dirt.
 """
 
 from __future__ import annotations
@@ -196,7 +197,7 @@ def maybe_run_git(
 
 def json_dump(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -300,7 +301,7 @@ def repo_paths(repo_root: Path) -> Tuple[Path, str, Path]:
 
 def init_spool(repo_root: Path) -> Tuple[Path, Dict[str, Any]]:
     repo_root, git_dir, spool = repo_paths(repo_root)
-    for sub in ("pending", "inflight", "done", "failed", "tmp-index"):
+    for sub in ("pending", "inflight", "prepared", "done", "failed", "tmp-index"):
         (spool / sub).mkdir(parents=True, exist_ok=True)
     meta = {
         "repo_root": str(repo_root),
@@ -663,6 +664,142 @@ def build_commit_message(repo_root: Path, entry: SnapshotEntry) -> str:
     return deterministic_commit_message(entry)
 
 
+def hidden_ref_name(spool: Path) -> str:
+    return f"refs/opencode-snapshot/{spool.name}"
+
+
+def publish_state_path(spool: Path) -> Path:
+    return spool / "publish-state.json"
+
+
+def hidden_ref_tip(repo_root: Path, spool: Path) -> Optional[str]:
+    code, out, _err = maybe_run_git(
+        repo_root, "rev-parse", "--verify", hidden_ref_name(spool)
+    )
+    return out if code == 0 and out else None
+
+
+def repo_special_state(repo_root: Path) -> Optional[str]:
+    git_dir = Path(run_git(repo_root, "rev-parse", "--absolute-git-dir"))
+    markers = {
+        "MERGE_HEAD": "merge",
+        "rebase-apply": "rebase",
+        "rebase-merge": "rebase",
+        "CHERRY_PICK_HEAD": "cherry-pick",
+        "REVERT_HEAD": "revert",
+        "BISECT_LOG": "bisect",
+    }
+    for name, label in markers.items():
+        if (git_dir / name).exists():
+            return label
+    return None
+
+
+def tracked_paths_from_payload(payload: Dict[str, Any]) -> List[str]:
+    change = payload.get("change") or {}
+    op = change.get("operation")
+    if op == "rename":
+        paths = [change.get("from_path"), change.get("to_path")]
+    else:
+        paths = [change.get("path")]
+    return [p for p in paths if isinstance(p, str) and p]
+
+
+def prepared_paths(spool: Path) -> List[str]:
+    seen = set()
+    paths: List[str] = []
+    for prepared_file in list_seq_files(spool / "prepared"):
+        payload = json.loads(prepared_file.read_text(encoding="utf-8"))
+        for path in tracked_paths_from_payload(payload):
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def worktree_matches_commit(repo_root: Path, commit_oid: str, paths: List[str]) -> bool:
+    if not paths:
+        return True
+    code_a, _out_a, _err_a = maybe_run_git(
+        repo_root, "diff", "--quiet", commit_oid, "--", *paths
+    )
+    return code_a == 0
+
+
+def can_publish_hidden_chain(repo_root: Path, spool: Path) -> Tuple[bool, str]:
+    hidden_tip = hidden_ref_tip(repo_root, spool)
+    if not hidden_tip:
+        publish_state_path(spool).unlink(missing_ok=True)
+        return False, "no hidden candidate tip"
+
+    state = json_load(publish_state_path(spool), {})
+    if not state:
+        debug("stale hidden ref without publish state; deleting candidate ref")
+        maybe_run_git(repo_root, "update-ref", "-d", hidden_ref_name(spool))
+        return False, "missing publish state"
+
+    if repo_special_state(repo_root):
+        return False, "repository operation in progress"
+
+    current_ref = current_branch_ref(repo_root)
+    if current_ref != state.get("branch_ref"):
+        return False, "checked-out branch changed"
+
+    current_visible_head = current_head(repo_root)
+    if current_visible_head != state.get("base_head"):
+        return False, "visible branch head changed"
+
+    pending_count = len(list_seq_files(spool / "pending"))
+    inflight_count = len(list_seq_files(spool / "inflight"))
+    if pending_count or inflight_count:
+        return False, "queue still changing"
+
+    spool_state = json_load(
+        spool / "state.json",
+        {"last_seq": 0, "last_enqueue_ts": 0.0, "last_worker_heartbeat": 0.0},
+    )
+    newest_enqueue = float(spool_state.get("last_enqueue_ts") or 0.0)
+    if monotonic_now() - newest_enqueue < QUIET_SECONDS:
+        return False, "quiet window not reached"
+
+    paths = prepared_paths(spool)
+    if not worktree_matches_commit(repo_root, hidden_tip, paths):
+        return False, "tracked paths do not match hidden candidate tip"
+
+    return True, "ok"
+
+
+def publish_hidden_chain(repo_root: Path, spool: Path) -> bool:
+    ok, reason = can_publish_hidden_chain(repo_root, spool)
+    if not ok:
+        if reason not in {"no hidden candidate tip", "quiet window not reached"}:
+            debug(f"publish skipped: {reason}")
+        return False
+
+    hidden_ref = hidden_ref_name(spool)
+    hidden_tip = hidden_ref_tip(repo_root, spool)
+    state_path = publish_state_path(spool)
+    state = json_load(state_path, {})
+    base_head = str(state.get("base_head") or "")
+    branch_ref = str(state.get("branch_ref") or "")
+    if not hidden_tip or not base_head or not branch_ref:
+        debug("publish skipped: incomplete publish state")
+        return False
+
+    run_git(repo_root, "update-ref", branch_ref, hidden_tip, base_head)
+
+    for prepared_file in list_seq_files(spool / "prepared"):
+        payload = json.loads(prepared_file.read_text(encoding="utf-8"))
+        payload["done_ts"] = monotonic_now()
+        mark_done(spool, prepared_file, payload)
+
+    maybe_run_git(repo_root, "update-ref", "-d", hidden_ref)
+    state_path.unlink(missing_ok=True)
+    debug(f"published hidden chain {hidden_tip} to {branch_ref}")
+    return True
+
+
 def enqueue_from_payload(payload: Dict[str, Any]) -> int:
     event = payload.get("event")
     if event != "file.changed":
@@ -803,20 +940,55 @@ def mark_failed(spool: Path, src: Path, payload: Dict[str, Any], error: str) -> 
 
 
 def build_commit(repo_root: Path, spool: Path, entry: SnapshotEntry) -> str:
+    hidden_ref = hidden_ref_name(spool)
+    publish_path = publish_state_path(spool)
+    publish_state = json_load(publish_path, {})
+
+    current_ref = current_branch_ref(repo_root)
+    if current_ref != entry.branch_ref:
+        raise GitError(
+            f"Branch changed from {entry.branch_ref} to {current_ref}; refusing to replay stale snapshot"
+        )
+
+    hidden_tip = hidden_ref_tip(repo_root, spool)
+    created_hidden_ref = False
+    if hidden_tip:
+        parent = hidden_tip
+        expected_base = str(publish_state.get("base_head") or "")
+        if not expected_base:
+            debug("stale hidden ref detected during prepare; resetting candidate ref")
+            maybe_run_git(repo_root, "update-ref", "-d", hidden_ref)
+            hidden_tip = None
+            parent = current_head(repo_root)
+            expected_base = parent
+            json_dump(
+                publish_path,
+                {
+                    "branch_ref": entry.branch_ref,
+                    "base_head": expected_base,
+                    "created_ts": monotonic_now(),
+                },
+            )
+            created_hidden_ref = True
+    else:
+        parent = current_head(repo_root)
+        expected_base = parent
+        json_dump(
+            publish_path,
+            {
+                "branch_ref": entry.branch_ref,
+                "base_head": expected_base,
+                "created_ts": monotonic_now(),
+            },
+        )
+        created_hidden_ref = True
+
     index_file = spool / "tmp-index" / f"index-{os.getpid()}"
     index_file.parent.mkdir(parents=True, exist_ok=True)
     if index_file.exists():
         index_file.unlink()
     env = os.environ.copy()
     env["GIT_INDEX_FILE"] = str(index_file)
-
-    branch_ref = current_branch_ref(repo_root)
-    if branch_ref != entry.branch_ref:
-        raise GitError(
-            f"Branch changed from {entry.branch_ref} to {branch_ref}; refusing to replay stale snapshot"
-        )
-
-    parent = current_head(repo_root)
     run_git(repo_root, "read-tree", parent, env=env)
 
     change = entry.change
@@ -869,7 +1041,10 @@ def build_commit(repo_root: Path, spool: Path, entry: SnapshotEntry) -> str:
         input_bytes=commit_message.encode("utf-8"),
         env=env,
     )
-    run_git(repo_root, "update-ref", entry.branch_ref, commit_oid, parent)
+    if created_hidden_ref:
+        run_git(repo_root, "update-ref", hidden_ref, commit_oid)
+    else:
+        run_git(repo_root, "update-ref", hidden_ref, commit_oid, parent)
     index_file.unlink(missing_ok=True)
     return commit_oid
 
@@ -896,6 +1071,8 @@ def worker(repo_root: Path, flush_only: bool = False) -> int:
             )
             state["last_worker_heartbeat"] = monotonic_now()
             json_dump(state_path, state)
+
+            publish_hidden_chain(repo_root, spool)
 
             pending_path = first_pending(spool)
             if pending_path is None:
@@ -928,9 +1105,11 @@ def worker(repo_root: Path, flush_only: bool = False) -> int:
                 entry = load_entry(inflight_path)
                 commit_oid = build_commit(repo_root, spool, entry)
                 payload["commit_oid"] = commit_oid
-                payload["done_ts"] = monotonic_now()
-                mark_done(spool, inflight_path, payload)
-                debug(f"committed seq={entry.seq} commit={commit_oid}")
+                payload["prepared_ts"] = monotonic_now()
+                json_dump(spool / "prepared" / inflight_path.name, payload)
+                inflight_path.unlink(missing_ok=True)
+                debug(f"prepared seq={entry.seq} commit={commit_oid}")
+                publish_hidden_chain(repo_root, spool)
             except Exception as exc:  # noqa: BLE001
                 debug(f"failed processing {inflight_path.name}: {exc}")
                 mark_failed(spool, inflight_path, payload, str(exc))
@@ -949,6 +1128,7 @@ def status(repo_root: Path) -> int:
     spool, _meta = init_spool(repo_root)
     pending = len(list_seq_files(spool / "pending"))
     inflight = len(list_seq_files(spool / "inflight"))
+    prepared = len(list_seq_files(spool / "prepared"))
     done = len(list_seq_files(spool / "done"))
     failed = len(list_seq_files(spool / "failed"))
     state = json_load(
@@ -961,8 +1141,11 @@ def status(repo_root: Path) -> int:
                 "spool": str(spool),
                 "pending": pending,
                 "inflight": inflight,
+                "prepared": prepared,
                 "done": done,
                 "failed": failed,
+                "hidden_ref": hidden_ref_tip(Path(repo_root), spool),
+                "publish_state": json_load(publish_state_path(spool), {}),
                 "state": state,
             },
             indent=2,
