@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS worker_state (
   started_ts      REAL
 );
 
+CREATE TABLE IF NOT EXISTS reconcile_pending (
+  branch_ref  TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  pre_mode    TEXT,
+  pre_oid     TEXT,
+  created_ts  REAL NOT NULL,
+  PRIMARY KEY (branch_ref, path)
+);
+
 INSERT OR IGNORE INTO worker_state(id, pid, heartbeat_ts, last_enqueue_ts, started_ts)
 VALUES (1, 0, 0, 0, 0);
 """
