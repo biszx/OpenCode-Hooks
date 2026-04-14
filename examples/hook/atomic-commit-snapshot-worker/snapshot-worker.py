@@ -19,7 +19,20 @@ through ``git cat-file --batch``.
 Built-in AI commit messages are also batched now. When AI is enabled and the
 backlog is within ``SNAPSHOTD_AI_MAX_QUEUE_DEPTH``, the worker generates and
 stores messages in chunks before the commit loop. If AI is off, skipped, or a
-chunk fails, it falls back to deterministic messages for the affected events.
+chunk fails, it falls back to ``SNAPSHOTD_COMMIT_MESSAGE_CMD`` if configured,
+otherwise deterministic commit messages, for the affected events.
+
+Contract note: pending rows are keyed by branch name, but safe replay depends on
+branch generation as well. ``events.base_head`` is the capture-time ancestry
+anchor, and later implementation also needs an explicit branch-incarnation
+signal to make
+delete-and-recreate detection trustworthy. Best-effort applies only to
+incomplete payload surfaces. Unsupported same-branch multi-worktree topologies
+or stale generations must be quarantined instead of replayed optimistically.
+Pre-enqueue detection should reject early; once a row exists, the worker should
+settle unsupported topology as ``blocked_conflict``. These notes describe the
+target contract for future work; the current worker still needs explicit
+generation and topology enforcement.
 """
 
 from __future__ import annotations
@@ -43,6 +56,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from snapshot_shared import (
+    IncompatibleLocalStateError,
+    LOCAL_STATE_SCHEMA_VERSION,
+    ensure_branch_registry,
+    quarantine_incompatible_local_state,
+    resolve_repo_paths,
+)
+
 
 STATE_SUBDIR = "ai-snapshotd"
 DB_SUBPATH = f"{STATE_SUBDIR}/snapshotd.db"
@@ -62,6 +83,7 @@ RECONCILE_RETRY_ATTEMPTS = max(
     1, int(os.environ.get("SNAPSHOTD_RECONCILE_RETRY_ATTEMPTS", "3"))
 )
 RECONCILE_RETRY_SLEEP = float(os.environ.get("SNAPSHOTD_RECONCILE_RETRY_SLEEP", "0.2"))
+RECONCILE_ABSENT = ("__snapshot_absent__", "__snapshot_absent__")
 
 DEBUG = os.environ.get("SNAPSHOTD_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
@@ -286,6 +308,13 @@ def ref_exists(repo_root: Path, ref: str) -> bool:
     return code == 0
 
 
+def ref_head(repo_root: Path, ref: str) -> Optional[str]:
+    code, out, _err = maybe_git(repo_root, "rev-parse", ref)
+    if code != 0:
+        return None
+    return out.strip() or None
+
+
 def repo_special_state(git_dir: Path) -> Optional[str]:
     markers = {
         "MERGE_HEAD": "merge",
@@ -380,6 +409,7 @@ def apply_ops_to_index(
 def reconcile_live_index(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     repo_root: Path,
     pre_publish_head_entries: Dict[str, Tuple[str, str]],
     post_publish_head_entries: Dict[str, Tuple[str, str]],
@@ -437,17 +467,23 @@ def reconcile_live_index(
             pre = pre_publish_head_entries.get(path)
             post = post_publish_head_entries.get(path)
             here = live.get(path)
+            if post == RECONCILE_ABSENT and here is None:
+                completed_paths.append(path)
+                continue
             if here == post:
                 completed_paths.append(path)
+                continue
+            if pre == RECONCILE_ABSENT and here is None:
+                safe_paths.append(path)
                 continue
             if pre == here:
                 safe_paths.append(path)
                 continue
-            if pre is None and here is not None:
+            if pre == RECONCILE_ABSENT and here is not None:
                 debug(f"reconcile: skip {path} (newly staged after publish)")
                 completed_paths.append(path)
                 continue
-            if pre is not None and here is None:
+            if pre not in {None, RECONCILE_ABSENT} and here is None:
                 debug(f"reconcile: skip {path} (index entry disappeared)")
                 completed_paths.append(path)
                 continue
@@ -460,7 +496,9 @@ def reconcile_live_index(
             if completed_paths:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    clear_reconcile_paths(conn, branch, completed_paths)
+                    clear_reconcile_paths(
+                        conn, branch, branch_generation, completed_paths
+                    )
                     conn.execute("COMMIT")
                 except Exception:
                     try:
@@ -486,7 +524,9 @@ def reconcile_live_index(
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            clear_reconcile_paths(conn, branch, [*completed_paths, *safe_paths])
+            clear_reconcile_paths(
+                conn, branch, branch_generation, [*completed_paths, *safe_paths]
+            )
             conn.execute("COMMIT")
         except Exception:
             try:
@@ -500,17 +540,27 @@ def reconcile_live_index(
 
 
 def retry_deferred_reconcile(
-    conn: sqlite3.Connection, repo_root: Path, branch: str
+    conn: sqlite3.Connection, repo_root: Path, branch: str, branch_generation: int
 ) -> bool:
-    rows = fetch_reconcile_pending(conn, branch)
+    rows = fetch_reconcile_pending(conn, branch, branch_generation)
     if not rows:
         return True
     pre_publish_head_entries: Dict[str, Tuple[str, str]] = {}
     post_publish_head_entries: Dict[str, Tuple[str, str]] = {}
     for row in rows:
-        if row["pre_mode"] is not None and row["pre_oid"] is not None:
+        if (
+            row["pre_mode"] == RECONCILE_ABSENT[0]
+            and row["pre_oid"] == RECONCILE_ABSENT[1]
+        ):
+            pre_publish_head_entries[row["path"]] = RECONCILE_ABSENT
+        elif row["pre_mode"] is not None and row["pre_oid"] is not None:
             pre_publish_head_entries[row["path"]] = (row["pre_mode"], row["pre_oid"])
-        if row["post_mode"] is not None and row["post_oid"] is not None:
+        if (
+            row["post_mode"] == RECONCILE_ABSENT[0]
+            and row["post_oid"] == RECONCILE_ABSENT[1]
+        ):
+            post_publish_head_entries[row["path"]] = RECONCILE_ABSENT
+        elif row["post_mode"] is not None and row["post_oid"] is not None:
             post_publish_head_entries[row["path"]] = (
                 row["post_mode"],
                 row["post_oid"],
@@ -519,6 +569,7 @@ def retry_deferred_reconcile(
     ok = reconcile_live_index(
         conn,
         branch,
+        branch_generation,
         repo_root,
         pre_publish_head_entries,
         post_publish_head_entries,
@@ -534,58 +585,115 @@ def retry_deferred_reconcile(
 # --------------------------------------------------------------------------- #
 
 
-def open_db(git_dir: Path) -> sqlite3.Connection:
+def _open_db_once(git_dir: Path) -> sqlite3.Connection:
     db_path = git_dir / DB_SUBPATH
     if not db_path.exists():
         raise RuntimeError(f"no snapshot database at {db_path}")
     conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS reconcile_pending (
-               branch_ref  TEXT NOT NULL,
-               path        TEXT NOT NULL,
-               pre_mode    TEXT,
-               pre_oid     TEXT,
-               post_mode   TEXT,
-               post_oid    TEXT,
-               created_ts  REAL NOT NULL,
-               PRIMARY KEY (branch_ref, path)
-           )"""
-    )
-    pending_existing = {
-        row[1] for row in conn.execute("PRAGMA table_info(reconcile_pending)")
-    }
-    if "post_mode" not in pending_existing:
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version not in (0, LOCAL_STATE_SCHEMA_VERSION):
+            raise IncompatibleLocalStateError(
+                f"incompatible snapshot DB user_version={version}; expected {LOCAL_STATE_SCHEMA_VERSION}"
+            )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS reconcile_pending (
+                   branch_ref  TEXT NOT NULL,
+                   branch_generation INTEGER NOT NULL,
+                   path        TEXT NOT NULL,
+                   pre_mode    TEXT,
+                   pre_oid     TEXT,
+                   post_mode   TEXT,
+                   post_oid    TEXT,
+                   created_ts  REAL NOT NULL,
+                   PRIMARY KEY (branch_ref, branch_generation, path)
+               )"""
+        )
+        pending_existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(reconcile_pending)")
+        }
+        if "post_mode" not in pending_existing:
+            try:
+                conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_mode TEXT")
+            except sqlite3.OperationalError:
+                pass
+        if "post_oid" not in pending_existing:
+            try:
+                conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_oid TEXT")
+            except sqlite3.OperationalError:
+                pass
+        if "branch_generation" not in pending_existing:
+            raise IncompatibleLocalStateError(
+                "legacy snapshot DB missing reconcile_pending.branch_generation"
+            )
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        if "branch_generation" not in existing:
+            raise IncompatibleLocalStateError(
+                "legacy snapshot DB missing events.branch_generation"
+            )
+        if "target_commit_oid" not in existing:
+            try:
+                conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
+            except sqlite3.OperationalError:
+                pass
+        if "message" not in existing:
+            try:
+                conn.execute("ALTER TABLE events ADD COLUMN message TEXT")
+            except sqlite3.OperationalError:
+                pass
+        path_tail_existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(path_tail)")
+        }
+        if "branch_generation" not in path_tail_existing:
+            raise IncompatibleLocalStateError(
+                "legacy snapshot DB missing path_tail.branch_generation"
+            )
+        conn.execute(f"PRAGMA user_version={LOCAL_STATE_SCHEMA_VERSION}")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def open_db(git_dir: Path, allow_reset: bool = False) -> sqlite3.Connection:
+    last_exc: Optional[Exception] = None
+    for _attempt in range(2):
         try:
-            conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_mode TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "post_oid" not in pending_existing:
-        try:
-            conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_oid TEXT")
-        except sqlite3.OperationalError:
-            pass
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
-    if "target_commit_oid" not in existing:
-        try:
-            conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "message" not in existing:
-        try:
-            conn.execute("ALTER TABLE events ADD COLUMN message TEXT")
-        except sqlite3.OperationalError:
-            pass
-    return conn
+            return _open_db_once(git_dir)
+        except IncompatibleLocalStateError as exc:
+            if not allow_reset:
+                raise
+            last_exc = exc
+            quarantined = quarantine_incompatible_local_state(git_dir, str(exc))
+            if quarantined is None:
+                debug("incompatible snapshot state disappeared before reset; retrying")
+            else:
+                debug(f"quarantined incompatible snapshot state at {quarantined}")
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("failed to open snapshot database")
+
+
+def ensure_db_ready(git_dir: Path) -> None:
+    conn = open_db(git_dir, allow_reset=True)
+    conn.close()
 
 
 def fetch_pending(conn: sqlite3.Connection, branch: str) -> List[sqlite3.Row]:
+    """Return pending rows for one symbolic branch ref.
+
+    ``base_head`` is intentionally loaded with each event because branch name
+    alone is not a sufficient replay contract. Downstream replay and recovery
+    logic should use it as the generation anchor for quarantine decisions once
+    the later enforcement work lands.
+    """
     return conn.execute(
-        """SELECT seq, branch_ref, base_head, session_id, tool_name, source,
+        """SELECT seq, branch_ref, branch_generation, base_head, session_id, tool_name, source,
                   captured_ts, message
            FROM events
            WHERE state='pending' AND branch_ref=?
@@ -618,6 +726,7 @@ def latest_enqueue(conn: sqlite3.Connection) -> float:
 def queue_reconcile_paths(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     pre_publish_head_entries: Dict[str, Tuple[str, str]],
     post_publish_head_entries: Dict[str, Tuple[str, str]],
     paths: List[str],
@@ -626,48 +735,53 @@ def queue_reconcile_paths(
     for path in sorted(set(paths)):
         pre = pre_publish_head_entries.get(path)
         post = post_publish_head_entries.get(path)
+        pre_mode, pre_oid = pre if pre is not None else RECONCILE_ABSENT
+        post_mode, post_oid = post if post is not None else RECONCILE_ABSENT
         conn.execute(
             """INSERT INTO reconcile_pending(
-                   branch_ref, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
-               )
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(branch_ref, path) DO UPDATE SET
-                  pre_mode=excluded.pre_mode,
-                  pre_oid=excluded.pre_oid,
+                   branch_ref, branch_generation, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
+                   pre_mode=COALESCE(reconcile_pending.pre_mode, excluded.pre_mode),
+                  pre_oid=COALESCE(reconcile_pending.pre_oid, excluded.pre_oid),
                   post_mode=excluded.post_mode,
                   post_oid=excluded.post_oid,
                   created_ts=excluded.created_ts""",
             (
                 branch,
+                branch_generation,
                 path,
-                pre[0] if pre else None,
-                pre[1] if pre else None,
-                post[0] if post else None,
-                post[1] if post else None,
+                pre_mode,
+                pre_oid,
+                post_mode,
+                post_oid,
                 now,
             ),
         )
 
 
-def fetch_reconcile_pending(conn: sqlite3.Connection, branch: str) -> List[sqlite3.Row]:
+def fetch_reconcile_pending(
+    conn: sqlite3.Connection, branch: str, branch_generation: int
+) -> List[sqlite3.Row]:
     return conn.execute(
-        """SELECT branch_ref, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
+        """SELECT branch_ref, branch_generation, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
            FROM reconcile_pending
-           WHERE branch_ref=?
+           WHERE branch_ref=? AND branch_generation=?
            ORDER BY created_ts, path""",
-        (branch,),
+        (branch, branch_generation),
     ).fetchall()
 
 
 def clear_reconcile_paths(
-    conn: sqlite3.Connection, branch: str, paths: Iterable[str]
+    conn: sqlite3.Connection, branch: str, branch_generation: int, paths: Iterable[str]
 ) -> None:
     unique = sorted(set(paths))
     if not unique:
         return
     conn.executemany(
-        "DELETE FROM reconcile_pending WHERE branch_ref=? AND path=?",
-        [(branch, path) for path in unique],
+        "DELETE FROM reconcile_pending WHERE branch_ref=? AND branch_generation=? AND path=?",
+        [(branch, branch_generation, path) for path in unique],
     )
 
 
@@ -691,14 +805,15 @@ def clear_worker_state(conn: sqlite3.Connection) -> None:
 def reset_tails_for_paths(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     paths_with_seqs: Iterable[Tuple[str, int]],
 ) -> None:
     """Delete path_tail entries only if they still point at the given
     source_seq. Guards against races with newer captures."""
     for path, seq in paths_with_seqs:
         conn.execute(
-            "DELETE FROM path_tail WHERE branch_ref=? AND path=? AND source_seq=?",
-            (branch, path, seq),
+            "DELETE FROM path_tail WHERE branch_ref=? AND branch_generation=? AND path=? AND source_seq=?",
+            (branch, branch_generation, path, seq),
         )
 
 
@@ -718,7 +833,12 @@ def retention_prune(conn: sqlite3.Connection) -> None:
 
 
 def cleanup_orphan_branches(conn: sqlite3.Connection, repo_root: Path) -> None:
-    """Events for branches that no longer exist will never drain."""
+    """Quarantine pending rows whose branch ref no longer exists.
+
+    Target contract: branch recreation under the same name is a new generation,
+    not a signal to replay stale pending work. This function currently handles
+    only the missing-ref case.
+    """
     rows = conn.execute(
         "SELECT DISTINCT branch_ref FROM events WHERE state='pending'"
     ).fetchall()
@@ -745,38 +865,135 @@ def cleanup_orphan_branches(conn: sqlite3.Connection, repo_root: Path) -> None:
             raise
 
 
-def recover_publishing(conn: sqlite3.Connection, repo_root: Path) -> None:
+def quarantine_pending_branch(
+    conn: sqlite3.Connection, branch: str, error: str
+) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        now = time.time()
+        conn.execute(
+            """UPDATE events SET state='blocked_conflict', error=?, settled_ts=?
+               WHERE state='pending' AND branch_ref=?""",
+            (error, now, branch),
+        )
+        conn.execute("DELETE FROM path_tail WHERE branch_ref=?", (branch,))
+        conn.execute("DELETE FROM reconcile_pending WHERE branch_ref=?", (branch,))
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def recover_publishing(
+    conn: sqlite3.Connection, repo_root: Path, git_dir: Path, common_dir: Path
+) -> None:
     """On startup, reconcile any leftover `publishing` events from a prior
-    worker that crashed between update-ref and settlement."""
+    worker that crashed between update-ref and settlement.
+
+    Target contract: this recovery path becomes generation-sensitive once
+    future implementation adds the explicit branch-generation checks. Until
+    then, this function performs the current restart behavior.
+    """
     rows = conn.execute(
-        """SELECT seq, branch_ref, target_commit_oid
-           FROM events WHERE state='publishing'"""
+        """SELECT seq, branch_ref, branch_generation, base_head, target_commit_oid
+           FROM events WHERE state='publishing'
+           ORDER BY branch_ref, branch_generation, seq"""
     ).fetchall()
     for row in rows:
         seq = int(row["seq"])
         branch = row["branch_ref"]
+        branch_generation = int(row["branch_generation"])
+        base_head = str(row["base_head"])
         target = row["target_commit_oid"]
+        ops = ops_as_dicts(fetch_ops(conn, seq))
+        tail_invalidations = [(path, seq) for path in paths_touched(ops)]
+        reconcile_pre, reconcile_post = reconcile_states_for_ops(ops)
+        reconcile_paths = paths_touched(ops)
+        next_state = "blocked_conflict"
+        next_commit_oid: Optional[str] = None
+        next_error = "publish recovery target missing from history"
+        should_clear_tails = True
         if not target or not ref_exists(repo_root, branch):
-            conn.execute(
-                """UPDATE events SET state='pending', target_commit_oid=NULL
-                   WHERE seq=?""",
-                (seq,),
-            )
-            continue
-        if is_ancestor(repo_root, target, branch):
-            conn.execute(
-                """UPDATE events SET state='published', commit_oid=?,
-                                     settled_ts=? WHERE seq=?""",
-                (target, time.time(), seq),
-            )
-            debug(f"recover: seq={seq} already published at {target}")
+            next_error = "branch gone during publish recovery"
         else:
-            conn.execute(
-                """UPDATE events SET state='pending', target_commit_oid=NULL
-                   WHERE seq=?""",
-                (seq,),
-            )
-            debug(f"recover: seq={seq} target {target} not in history; requeued")
+            try:
+                branch_head = ref_head(repo_root, branch)
+                if not branch_head:
+                    next_error = "branch gone during publish recovery"
+                else:
+                    branch_state = ensure_branch_registry(
+                        repo_root,
+                        git_dir,
+                        common_dir,
+                        branch,
+                        branch_head,
+                        claim_owner=False,
+                    )
+                    if branch_generation != int(branch_state["generation"]):
+                        next_error = f"stale branch generation {branch_generation} != {branch_state['generation']}"
+                    elif not is_ancestor(repo_root, base_head, branch_head):
+                        next_error = "stale branch ancestry during publish recovery"
+                    elif is_ancestor(repo_root, target, branch):
+                        next_state = "published"
+                        next_commit_oid = target
+                        next_error = None
+                    else:
+                        next_state = "pending"
+                        next_error = None
+                        should_clear_tails = False
+            except RuntimeError as exc:
+                next_error = str(exc)
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if next_state == "published":
+                conn.execute(
+                    """UPDATE events SET state='published', commit_oid=?,
+                                         target_commit_oid=?, error=NULL, settled_ts=?
+                       WHERE seq=?""",
+                    (next_commit_oid, target, time.time(), seq),
+                )
+                queue_reconcile_paths(
+                    conn,
+                    branch,
+                    branch_generation,
+                    reconcile_pre,
+                    reconcile_post,
+                    reconcile_paths,
+                )
+            elif next_state == "pending":
+                conn.execute(
+                    """UPDATE events SET state='pending', target_commit_oid=NULL,
+                                         error=NULL WHERE seq=?""",
+                    (seq,),
+                )
+            else:
+                conn.execute(
+                    """UPDATE events SET state='blocked_conflict', target_commit_oid=NULL,
+                                         error=?, settled_ts=? WHERE seq=?""",
+                    (next_error, time.time(), seq),
+                )
+            if should_clear_tails and tail_invalidations:
+                reset_tails_for_paths(
+                    conn, branch, branch_generation, tail_invalidations
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+        if next_state == "published":
+            debug(f"recover: seq={seq} already published at {target}")
+        elif next_state == "pending":
+            debug(f"recover: seq={seq} target {target} requeued")
+        else:
+            debug(f"recover: seq={seq} target {target} quarantined")
 
 
 # --------------------------------------------------------------------------- #
@@ -1142,8 +1359,9 @@ def batch_ai_messages(
     ``{seq: "subject\\n\\nbody"}`` mapping (sanitized).
 
     Returns an empty mapping for any chunk whose request or response fails
-    validation, so callers can fall back to deterministic messages for the
-    affected events.
+    validation, so callers can fall back to
+    ``SNAPSHOTD_COMMIT_MESSAGE_CMD`` if configured, otherwise deterministic
+    commit messages, for the affected events.
     """
     if not events_with_ops:
         return {}
@@ -1347,12 +1565,55 @@ def paths_touched(ops: List[Dict[str, Any]]) -> List[str]:
     return paths
 
 
+def reconcile_states_for_ops(
+    ops: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Tuple[str, str]]]:
+    pre: Dict[str, Tuple[str, str]] = {}
+    post: Dict[str, Tuple[str, str]] = {}
+    for op in ops:
+        before = None
+        after = None
+        if op.get("before_mode") is not None and op.get("before_oid") is not None:
+            before = (op["before_mode"], op["before_oid"])
+        if op.get("after_mode") is not None and op.get("after_oid") is not None:
+            after = (op["after_mode"], op["after_oid"])
+        kind = op["op"]
+        path = op["path"]
+        if kind == "rename":
+            old_path = op.get("old_path")
+            if old_path and before is not None:
+                pre[old_path] = before
+            if after is not None:
+                post[path] = after
+            continue
+        if before is not None:
+            pre[path] = before
+        if after is not None:
+            post[path] = after
+    return pre, post
+
+
 def replay_batch(
     conn: sqlite3.Connection,
     repo_root: Path,
     git_dir: Path,
+    common_dir: Path,
     branch: str,
 ) -> int:
+    """Replay all pending events for one branch ref.
+
+    Target replay contract needs more than ``branch_ref == current_branch``:
+
+    - the live branch tip must still belong to the same generation captured in
+      each event's ``base_head``;
+    - exact autocommit assumes one worktree owns a branch at a time;
+    - stale generations or unsupported same-branch multi-worktree topologies
+      should settle as quarantine-style ``blocked_conflict`` rows instead of
+      being replayed against a new branch incarnation.
+
+    The current code path is being documented toward that contract; later
+    implementation still needs to add the explicit checks.
+    """
     events = fetch_pending(conn, branch)
     if not events:
         return 0
@@ -1369,6 +1630,15 @@ def replay_batch(
     if live_branch != branch:
         debug(f"worker branch {branch} != live {live_branch}; deferring")
         return 0
+    try:
+        branch_state = ensure_branch_registry(
+            repo_root, git_dir, common_dir, branch, head
+        )
+    except RuntimeError as exc:
+        debug(f"branch registry rejected replay on {branch}: {exc}")
+        quarantine_pending_branch(conn, branch, str(exc))
+        return 0
+    branch_generation = int(branch_state["generation"])
 
     index_file = git_dir / INDEX_SUBPATH
     index_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1468,6 +1738,18 @@ def replay_batch(
         parent = head
 
         for event, ops in all_event_ops:
+            if int(event["branch_generation"]) != branch_generation:
+                blocked.append(
+                    (
+                        int(event["seq"]),
+                        f"stale branch generation {event['branch_generation']} != {branch_generation}",
+                        ops,
+                    )
+                )
+                continue
+            if not is_ancestor(repo_root, str(event["base_head"]), head):
+                blocked.append((int(event["seq"]), "stale branch ancestry", ops))
+                continue
             if not ops:
                 failed.append((int(event["seq"]), "no ops", []))
                 continue
@@ -1526,7 +1808,7 @@ def replay_batch(
 
     if not prepared:
         if blocked or failed:
-            settle_non_commit_results(conn, branch, blocked, failed)
+            settle_non_commit_results(conn, branch, branch_generation, blocked, failed)
         return 0
 
     seqs_to_publish = [seq for seq, _oid, _ops in prepared]
@@ -1569,25 +1851,6 @@ def replay_batch(
         return -1
 
     # Phase 3: settle.
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        now = time.time()
-        for seq, commit_oid, _ops in prepared:
-            conn.execute(
-                """UPDATE events SET state='published', commit_oid=?,
-                                     settled_ts=? WHERE seq=?""",
-                (commit_oid, now, seq),
-            )
-        _settle_blocked_failed(conn, branch, blocked, failed, now)
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass
-        raise
-
-    # Reconcile live index only where it's safe.
     touched: List[str] = []
     for _seq, _oid, ops in prepared:
         for p in paths_touched(ops):
@@ -1597,7 +1860,29 @@ def replay_batch(
     }
     conn.execute("BEGIN IMMEDIATE")
     try:
-        queue_reconcile_paths(conn, branch, head_state, post_publish_state, touched)
+        now = time.time()
+        published_tail_invalidations: List[Tuple[str, int]] = []
+        for seq, commit_oid, _ops in prepared:
+            conn.execute(
+                """UPDATE events SET state='published', commit_oid=?,
+                                     settled_ts=? WHERE seq=?""",
+                (commit_oid, now, seq),
+            )
+            for path in paths_touched(_ops):
+                published_tail_invalidations.append((path, seq))
+        if published_tail_invalidations:
+            reset_tails_for_paths(
+                conn, branch, branch_generation, published_tail_invalidations
+            )
+        _settle_blocked_failed(conn, branch, branch_generation, blocked, failed, now)
+        queue_reconcile_paths(
+            conn,
+            branch,
+            branch_generation,
+            head_state,
+            post_publish_state,
+            touched,
+        )
         conn.execute("COMMIT")
     except Exception:
         try:
@@ -1605,7 +1890,13 @@ def replay_batch(
         except sqlite3.OperationalError:
             pass
         raise
-    retry_deferred_reconcile(conn, repo_root, branch)
+
+    try:
+        ensure_branch_registry(repo_root, git_dir, common_dir, branch, final_parent)
+    except RuntimeError as exc:
+        debug(f"branch registry refresh failed after publish on {branch}: {exc}")
+
+    retry_deferred_reconcile(conn, repo_root, branch, branch_generation)
     debug(f"published {len(prepared)} commit(s) to {branch}: tip={final_parent}")
     return len(prepared)
 
@@ -1613,6 +1904,7 @@ def replay_batch(
 def _settle_blocked_failed(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     blocked: List[Tuple[int, str, List[Dict[str, Any]]]],
     failed: List[Tuple[int, str, List[Dict[str, Any]]]],
     now: float,
@@ -1635,18 +1927,21 @@ def _settle_blocked_failed(
         for path in paths_touched(ops):
             tail_invalidations.append((path, seq))
     if tail_invalidations:
-        reset_tails_for_paths(conn, branch, tail_invalidations)
+        reset_tails_for_paths(conn, branch, branch_generation, tail_invalidations)
 
 
 def settle_non_commit_results(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     blocked: List[Tuple[int, str, List[Dict[str, Any]]]],
     failed: List[Tuple[int, str, List[Dict[str, Any]]]],
 ) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        _settle_blocked_failed(conn, branch, blocked, failed, time.time())
+        _settle_blocked_failed(
+            conn, branch, branch_generation, blocked, failed, time.time()
+        )
         conn.execute("COMMIT")
     except Exception:
         try:
@@ -1662,10 +1957,11 @@ def settle_non_commit_results(
 
 
 def worker_loop(repo_root: Path, git_dir: Path) -> int:
+    _repo_root, _git_dir, common_dir = resolve_repo_paths(repo_root)
     conn = open_db(git_dir)
     try:
         update_heartbeat(conn, os.getpid())
-        recover_publishing(conn, repo_root)
+        recover_publishing(conn, repo_root, git_dir, common_dir)
         cleanup_orphan_branches(conn, repo_root)
         retention_prune(conn)
 
@@ -1693,7 +1989,17 @@ def worker_loop(repo_root: Path, git_dir: Path) -> int:
                 interruptible_sleep(POLL_SECONDS)
                 continue
 
-            retry_deferred_reconcile(conn, repo_root, branch)
+            head = current_head(repo_root)
+            if head is not None:
+                try:
+                    branch_state = ensure_branch_registry(
+                        repo_root, git_dir, common_dir, branch, head
+                    )
+                    retry_deferred_reconcile(
+                        conn, repo_root, branch, int(branch_state["generation"])
+                    )
+                except RuntimeError as exc:
+                    debug(f"branch registry rejected reconcile on {branch}: {exc}")
 
             pending = fetch_pending(conn, branch)
             if not pending:
@@ -1706,7 +2012,7 @@ def worker_loop(repo_root: Path, git_dir: Path) -> int:
                 continue
 
             idle_since = None
-            result = replay_batch(conn, repo_root, git_dir, branch)
+            result = replay_batch(conn, repo_root, git_dir, common_dir, branch)
             if result == -1:
                 interruptible_sleep(POLL_SECONDS)
                 continue
@@ -1717,6 +2023,7 @@ def worker_loop(repo_root: Path, git_dir: Path) -> int:
 
 
 def run_worker(repo_root: Path, git_dir: Path) -> int:
+    ensure_db_ready(git_dir)
     lock = Singleton(git_dir / LOCK_SUBPATH)
     if not lock.acquire(attempts=10, sleep=0.05):
         debug("another worker holds the lock; exiting")
@@ -1735,7 +2042,7 @@ def run_worker(repo_root: Path, git_dir: Path) -> int:
 
 
 def cmd_status(git_dir: Path) -> int:
-    conn = open_db(git_dir)
+    conn = open_db(git_dir, allow_reset=False)
     try:
         counts = {
             state: conn.execute(
@@ -1776,6 +2083,7 @@ def cmd_status(git_dir: Path) -> int:
 
 
 def cmd_flush(repo_root: Path, git_dir: Path) -> int:
+    ensure_db_ready(git_dir)
     lock = Singleton(git_dir / LOCK_SUBPATH)
     if not lock.acquire(attempts=20, sleep=0.1):
         print("another worker is running; could not acquire lock", file=sys.stderr)
@@ -1783,21 +2091,30 @@ def cmd_flush(repo_root: Path, git_dir: Path) -> int:
     try:
         conn = open_db(git_dir)
         try:
-            recover_publishing(conn, repo_root)
+            _repo_root, _git_dir, common_dir = resolve_repo_paths(repo_root)
+            recover_publishing(conn, repo_root, git_dir, common_dir)
             branch = current_branch(repo_root)
             if branch is None:
                 print("detached HEAD, nothing to flush", file=sys.stderr)
                 return 1
-            retry_deferred_reconcile(conn, repo_root, branch)
+            head = current_head(repo_root)
+            if head is None:
+                print("could not resolve HEAD, nothing to flush", file=sys.stderr)
+                return 1
+            branch_state = ensure_branch_registry(
+                repo_root, git_dir, common_dir, branch, head
+            )
+            branch_generation = int(branch_state["generation"])
+            retry_deferred_reconcile(conn, repo_root, branch, branch_generation)
             for _ in range(20):
-                result = replay_batch(conn, repo_root, git_dir, branch)
+                result = replay_batch(conn, repo_root, git_dir, common_dir, branch)
                 if result == 0:
                     break
                 if result == -1:
                     time.sleep(0.1)
                     continue
-                retry_deferred_reconcile(conn, repo_root, branch)
-            retry_deferred_reconcile(conn, repo_root, branch)
+                retry_deferred_reconcile(conn, repo_root, branch, branch_generation)
+            retry_deferred_reconcile(conn, repo_root, branch, branch_generation)
             remaining = pending_count_for_branch(conn, branch)
             if remaining > 0:
                 print(
