@@ -382,9 +382,17 @@ def reconcile_live_index(
     branch: str,
     repo_root: Path,
     pre_publish_head_entries: Dict[str, Tuple[str, str]],
+    post_publish_head_entries: Dict[str, Tuple[str, str]],
     paths: List[str],
 ) -> bool:
-    """Reset only paths whose live index entry still matches pre-publish HEAD.
+    """Reset only paths whose live index still looks hook-owned.
+
+    Safe cases:
+    - the live index still matches the pre-publish HEAD entry, so reset can move
+      it to the new HEAD entry.
+    - the live index already matches the post-publish HEAD entry, so cleanup is
+      already effectively done and we can clear the pending row.
+
     If the live index is transiently locked, leave the paths queued for retry.
     If the user staged something else meanwhile, skip that path permanently.
     """
@@ -427,22 +435,26 @@ def reconcile_live_index(
         completed_paths: List[str] = []
         for path in unique:
             pre = pre_publish_head_entries.get(path)
+            post = post_publish_head_entries.get(path)
             here = live.get(path)
-            if pre is None and here is None:
+            if here == post:
                 completed_paths.append(path)
-                continue
-            if pre is None and here is not None:
-                debug(f"reconcile: skip {path} (newly staged)")
-                completed_paths.append(path)
-                continue
-            if pre is not None and here is None:
-                safe_paths.append(path)
                 continue
             if pre == here:
                 safe_paths.append(path)
-            else:
-                debug(f"reconcile: skip {path} (staged diverges from HEAD)")
+                continue
+            if pre is None and here is not None:
+                debug(f"reconcile: skip {path} (newly staged after publish)")
                 completed_paths.append(path)
+                continue
+            if pre is not None and here is None:
+                debug(f"reconcile: skip {path} (index entry disappeared)")
+                completed_paths.append(path)
+                continue
+            debug(
+                f"reconcile: skip {path} (staged diverges from pre/post publish state)"
+            )
+            completed_paths.append(path)
 
         if not safe_paths:
             if completed_paths:
@@ -494,11 +506,24 @@ def retry_deferred_reconcile(
     if not rows:
         return True
     pre_publish_head_entries: Dict[str, Tuple[str, str]] = {}
+    post_publish_head_entries: Dict[str, Tuple[str, str]] = {}
     for row in rows:
         if row["pre_mode"] is not None and row["pre_oid"] is not None:
             pre_publish_head_entries[row["path"]] = (row["pre_mode"], row["pre_oid"])
+        if row["post_mode"] is not None and row["post_oid"] is not None:
+            post_publish_head_entries[row["path"]] = (
+                row["post_mode"],
+                row["post_oid"],
+            )
     paths = [row["path"] for row in rows]
-    ok = reconcile_live_index(conn, branch, repo_root, pre_publish_head_entries, paths)
+    ok = reconcile_live_index(
+        conn,
+        branch,
+        repo_root,
+        pre_publish_head_entries,
+        post_publish_head_entries,
+        paths,
+    )
     if not ok:
         debug(f"reconcile: deferred cleanup still pending for {len(paths)} path(s)")
     return ok
@@ -525,10 +550,25 @@ def open_db(git_dir: Path) -> sqlite3.Connection:
                path        TEXT NOT NULL,
                pre_mode    TEXT,
                pre_oid     TEXT,
+               post_mode   TEXT,
+               post_oid    TEXT,
                created_ts  REAL NOT NULL,
                PRIMARY KEY (branch_ref, path)
            )"""
     )
+    pending_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(reconcile_pending)")
+    }
+    if "post_mode" not in pending_existing:
+        try:
+            conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_mode TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "post_oid" not in pending_existing:
+        try:
+            conn.execute("ALTER TABLE reconcile_pending ADD COLUMN post_oid TEXT")
+        except sqlite3.OperationalError:
+            pass
     existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "target_commit_oid" not in existing:
         try:
@@ -579,25 +619,39 @@ def queue_reconcile_paths(
     conn: sqlite3.Connection,
     branch: str,
     pre_publish_head_entries: Dict[str, Tuple[str, str]],
+    post_publish_head_entries: Dict[str, Tuple[str, str]],
     paths: List[str],
 ) -> None:
     now = time.time()
     for path in sorted(set(paths)):
         pre = pre_publish_head_entries.get(path)
+        post = post_publish_head_entries.get(path)
         conn.execute(
-            """INSERT INTO reconcile_pending(branch_ref, path, pre_mode, pre_oid, created_ts)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO reconcile_pending(
+                   branch_ref, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(branch_ref, path) DO UPDATE SET
-                 pre_mode=excluded.pre_mode,
-                 pre_oid=excluded.pre_oid,
-                 created_ts=excluded.created_ts""",
-            (branch, path, pre[0] if pre else None, pre[1] if pre else None, now),
+                  pre_mode=excluded.pre_mode,
+                  pre_oid=excluded.pre_oid,
+                  post_mode=excluded.post_mode,
+                  post_oid=excluded.post_oid,
+                  created_ts=excluded.created_ts""",
+            (
+                branch,
+                path,
+                pre[0] if pre else None,
+                pre[1] if pre else None,
+                post[0] if post else None,
+                post[1] if post else None,
+                now,
+            ),
         )
 
 
 def fetch_reconcile_pending(conn: sqlite3.Connection, branch: str) -> List[sqlite3.Row]:
     return conn.execute(
-        """SELECT branch_ref, path, pre_mode, pre_oid, created_ts
+        """SELECT branch_ref, path, pre_mode, pre_oid, post_mode, post_oid, created_ts
            FROM reconcile_pending
            WHERE branch_ref=?
            ORDER BY created_ts, path""",
@@ -1538,9 +1592,12 @@ def replay_batch(
     for _seq, _oid, ops in prepared:
         for p in paths_touched(ops):
             touched.append(p)
+    post_publish_state = {
+        path: state[path] for path in sorted(set(touched)) if path in state
+    }
     conn.execute("BEGIN IMMEDIATE")
     try:
-        queue_reconcile_paths(conn, branch, head_state, touched)
+        queue_reconcile_paths(conn, branch, head_state, post_publish_state, touched)
         conn.execute("COMMIT")
     except Exception:
         try:
