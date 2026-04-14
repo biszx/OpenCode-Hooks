@@ -1,93 +1,122 @@
-# Snapshot autocommit — SQLite version
+# Snapshot autocommit, SQLite version
 
-Two files, one SQLite database per worktree, one singleton worker per
-worktree. Works the same way regardless of which harness (Claude Code,
-OpenCode, Codex, …) fires the hook, as long as the harness sends a tool
-payload to stdin.
+This setup gives you one hook, one worker, and one SQLite queue per worktree.
+It watches file edits, snapshots them into git objects, then replays them as
+real commits after a short quiet window.
 
-## What the two files do
+If you want the short version:
 
-- `snapshot-hook.py` — ingress. Reads the harness's JSON on stdin, extracts
-  changed file paths, hashes each file into a git blob, and atomically
-  inserts an event row + updates `path_tail` inside one `BEGIN IMMEDIATE`
-  transaction. Then either sends `SIGUSR1` to the live worker or spawns a
-  new one.
-- `snapshot-worker.py` — egress. Singleton per worktree. Waits for a quiet
-  window, replays pending events onto the current branch tip by batch-
-  applying ops to a temp git index, publishes with a compare-and-swap
-  `git update-ref`, and exits after an idle timeout. Publish is two-phase:
-  events are marked `publishing` with a target commit OID before the
-  branch is moved, so a crash in the middle can be reconciled on restart.
+- `snapshot-hook.py` captures file changes and queues them.
+- `snapshot-worker.py` drains the queue and publishes commits.
+- Each worktree gets its own isolated state under its private git dir.
+- Built-in AI commit messages are optional. If AI is off or skipped, the worker
+  falls back to deterministic messages.
 
-## Where files live
+## What it does
 
-### Scripts
+There are two files:
 
-Put `snapshot-hook.py` and `snapshot-worker.py` in the same directory. The
-hook finds the worker via `__file__` by default. You can override with
-`SNAPSHOTD_WORKER_PATH=/abs/path/to/snapshot-worker.py`.
+- `snapshot-hook.py`
+  - Reads hook payload JSON from stdin
+  - Figures out which files changed
+  - Hashes current file contents into git blobs
+  - Writes an event plus `path_tail` updates in one `BEGIN IMMEDIATE`
+    transaction
+  - Wakes the live worker with `SIGUSR1`, or spawns one if needed
 
-Make them executable:
+- `snapshot-worker.py`
+  - Waits for a quiet window
+  - Replays pending events onto the current branch tip using a temporary git
+    index
+  - Publishes with `git update-ref` compare-and-swap
+  - Uses a two-phase publish so crashes can be recovered on restart
+
+Why split it this way? The hook stays cheap and fast. It just captures state.
+The worker does the expensive part later, once edits settle down.
+
+## Where state lives
+
+Put `snapshot-hook.py` and `snapshot-worker.py` in the same directory. By
+default, the hook finds the worker via `__file__`. If you need to override it,
+set:
+
+```bash
+export SNAPSHOTD_WORKER_PATH=/abs/path/to/snapshot-worker.py
+```
+
+Make both scripts executable:
 
 ```bash
 chmod +x snapshot-hook.py snapshot-worker.py
 ```
 
-### Per-worktree state
+Each worktree stores its own state inside its private git dir.
 
-Each worktree gets its own isolated state directory inside its private git
-dir. `git rev-parse --absolute-git-dir` returns:
+Examples:
 
 - main worktree: `/path/to/repo/.git`
 - linked worktree: `/path/to/repo/.git/worktrees/<name>`
 
-The hook and worker auto-create:
+The hook and worker create these paths automatically:
 
-- `<git-dir>/ai-snapshotd/snapshotd.db`      — SQLite journal (WAL mode)
-- `<git-dir>/ai-snapshotd/worker.lock`       — singleton flock
-- `<git-dir>/ai-snapshotd/worker.index`      — scratch git index
-- `<git-dir>/ai-snapshotd/logs/hook.log`     — hook debug log (rotated)
-- `<git-dir>/ai-snapshotd/logs/worker.log`   — worker debug log (rotated)
+| Path | Purpose |
+|------|---------|
+| `<git-dir>/ai-snapshotd/snapshotd.db` | SQLite queue, WAL mode |
+| `<git-dir>/ai-snapshotd/worker.lock` | Singleton worker lock |
+| `<git-dir>/ai-snapshotd/worker.index` | Temporary git index for replay |
+| `<git-dir>/ai-snapshotd/logs/hook.log` | Rotated hook debug log |
+| `<git-dir>/ai-snapshotd/logs/worker.log` | Rotated worker debug log |
 
-Open 5 projects × 3 worktrees and you automatically get 15 independent
-journals and 15 independent workers.
+This isolation matters. Five projects with three worktrees each means fifteen
+independent queues and fifteen independent workers, not one shared bottleneck.
 
-## States an event can be in
+## Event states
 
-| State              | Meaning                                                                                       |
-|--------------------|-----------------------------------------------------------------------------------------------|
-| `pending`          | Captured, not yet replayed                                                                    |
-| `publishing`       | Commit-tree objects built, about to call update-ref. Transient. Reconciled on worker restart. |
-| `published`        | Branch has been moved to include this event                                                    |
-| `blocked_conflict` | Can't replay cleanly: `before` state doesn't match current index for one of its paths          |
-| `failed`           | Hard error during build (commit-tree failed, etc.). Path tails cleared.                        |
+| State | Meaning |
+|------|---------|
+| `pending` | Captured and waiting to replay |
+| `publishing` | Commit objects are built and `update-ref` is next |
+| `published` | The branch now includes the event |
+| `blocked_conflict` | Replay could not apply cleanly against current state |
+| `failed` | Hard error during replay or commit creation |
+
+`publishing` is intentionally transient. If the worker crashes between
+`update-ref` and DB settlement, startup recovery checks whether the target
+commit made it into history and fixes the state from there.
 
 ## Concurrency guarantees
 
-- **Concurrent hooks for the same path** — serialized. All path_tail reads
-  and writes happen inside one `BEGIN IMMEDIATE`, with a CAS retry on the
-  observed `source_seq`. Two hooks racing on the same file cannot capture
-  the same `before` state.
-- **Concurrent worker invocations** — one wins the flock, others exit. The
-  hook prefers `SIGUSR1` to an already-alive worker (heartbeat within
-  `SNAPSHOTD_HEARTBEAT_STALE` seconds) over spawning a new Python process.
-- **Multiple worktrees** — separate git dirs → separate DBs → separate
-  workers. Zero cross-contention.
-- **Branch switching** — worker only processes events for the current
-  branch, and its idle exit condition only considers current-branch
-  pending. Events on other branches stay `pending` until someone checks
-  out that branch. Events on branches that no longer exist get marked
-  `blocked_conflict` at startup.
-- **Crash between update-ref and DB settlement** — leftover `publishing`
-  rows are reconciled on worker restart: if the target commit is an
-  ancestor of the branch tip, mark `published`; otherwise back to
-  `pending`.
+- **Same-path hooks are serialized**
+  - `path_tail` reads and writes happen inside one `BEGIN IMMEDIATE`
+    transaction.
+  - Two hooks racing on the same file do not capture the same `before` state.
+
+- **Only one worker drains a worktree**
+  - The worker takes a flock on `worker.lock`.
+  - If another worker starts, it exits.
+  - The hook prefers signalling a live worker over spawning a new one.
+
+- **Worktrees stay isolated**
+  - Different git dirs mean different DBs, locks, logs, and workers.
+  - No cross-worktree contention.
+
+- **Branch-specific replay**
+  - The worker only processes pending events for the currently checked out
+    branch.
+  - Events for other branches stay pending until that branch is active again.
+  - If a branch is gone, pending events for it become `blocked_conflict`.
+
+- **Crash recovery is explicit**
+  - Leftover `publishing` rows are reconciled on startup.
+  - If the target commit is already an ancestor of the branch tip, the event is
+    marked `published`.
+  - Otherwise it goes back to `pending`.
 
 ## Wiring
 
 ### Claude Code
 
-`~/.claude/settings.json` or `.claude/settings.json` in the project:
+Add this to `~/.claude/settings.json` or `.claude/settings.json` in the repo:
 
 ```json
 {
@@ -110,7 +139,7 @@ journals and 15 independent workers.
 
 ### OpenCode
 
-`~/.config/opencode/opencode.json`:
+Add this to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -129,44 +158,83 @@ journals and 15 independent workers.
 
 ### Codex
 
-Codex CLI hooks currently emit only `Bash` PostToolUse. Wire the hook
-there if you want best-effort scanning of shell-driven edits. Exact per-
-edit capture needs Codex app-server or a shared MCP edit surface.
+Codex CLI currently emits `Bash` PostToolUse events only. That means this hook
+can do best-effort capture for shell-driven edits, but not exact per-edit
+capture for every tool. If you need exact per-edit capture, use Codex
+app-server or a shared MCP edit surface.
 
-## Environment knobs
+## Environment variables
 
-| Variable                              | Default                  | Purpose                                                              |
-|---------------------------------------|--------------------------|----------------------------------------------------------------------|
-| `SNAPSHOTD_QUIET_SECONDS`             | `1.0`                    | Wait this long after the last enqueue before replaying               |
-| `SNAPSHOTD_IDLE_SECONDS`              | `30.0`                   | Worker exits after this much idle time on the current branch         |
-| `SNAPSHOTD_POLL_SECONDS`              | `0.35`                   | Worker poll interval                                                 |
-| `SNAPSHOTD_HEARTBEAT_STALE`           | `15.0`                   | Older heartbeats are treated as dead workers                         |
-| `SNAPSHOTD_AI_ENABLE`                 | off                      | Explicit opt-in for the built-in OpenAI commit-message path         |
-| `SNAPSHOTD_AI_MAX_QUEUE_DEPTH`        | `2`                      | AI messages are skipped when pending depth exceeds this              |
-| `SNAPSHOTD_COMMIT_MESSAGE_CMD`        | unset                    | argv-style command; reads event JSON on stdin, prints a message. No shell. |
-| `SNAPSHOTD_SENSITIVE_GLOBS`           | `.env,*.pem,*.key,…`     | Comma-separated globs whose diffs are redacted before AI            |
-| `SNAPSHOTD_RETENTION_SECONDS`         | `604800` (7 days)        | Published/blocked/failed rows older than this are pruned on startup |
-| `SNAPSHOTD_LOG_MAX_BYTES` / `_KEEP`   | `2 MiB` / `3`            | Log rotation threshold and keep count                                |
-| `SNAPSHOTD_DEBUG`                     | off                      | Write to `<git-dir>/ai-snapshotd/logs/*.log`                         |
-| `SNAPSHOTD_WORKER_PATH`               | sibling                  | Override the worker script path                                      |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL`  | unset / OpenAI default   | Required for built-in AI path. Base URL must be `https://`.          |
-| `OPENAI_MODEL`                        | `gpt-5.4-mini`           | Model used when AI is enabled                                        |
-| `OPENAI_API_TIMEOUT`                  | `15`                     | Seconds                                                              |
+| Variable | Default | What it controls |
+|----------|---------|------------------|
+| `SNAPSHOTD_QUIET_SECONDS` | `1.0` | How long the worker waits after the last enqueue before replay starts |
+| `SNAPSHOTD_IDLE_SECONDS` | `30.0` | How long the worker stays alive with no work on the current branch |
+| `SNAPSHOTD_POLL_SECONDS` | `0.35` | Poll interval while waiting |
+| `SNAPSHOTD_HEARTBEAT_STALE` | `15.0` | Age after which a worker heartbeat is treated as dead |
+| `SNAPSHOTD_AI_ENABLE` | off | Enables built-in AI commit messages |
+| `SNAPSHOTD_AI_MAX_QUEUE_DEPTH` | `2` | Backlog depth above which built-in AI batching is skipped |
+| `SNAPSHOTD_AI_CHUNK_SIZE` | `20` | Max events per structured-output AI request, clamped to `1..100` |
+| `SNAPSHOTD_COMMIT_MESSAGE_CMD` | unset | Custom argv-style message command, run per event |
+| `SNAPSHOTD_SENSITIVE_GLOBS` | `.env,*.pem,*.key,…` | Paths whose diffs are redacted before any network call |
+| `SNAPSHOTD_RETENTION_SECONDS` | `604800` | How long settled rows are kept before pruning |
+| `SNAPSHOTD_LOG_MAX_BYTES` / `_KEEP` | `2 MiB` / `3` | Log rotation threshold and retained files |
+| `SNAPSHOTD_DEBUG` | off | Writes debug logs under `<git-dir>/ai-snapshotd/logs/` |
+| `SNAPSHOTD_WORKER_PATH` | sibling file | Override worker script path |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | unset / OpenAI default | Required for built-in AI mode. Base URL must be `https://` |
+| `OPENAI_MODEL` | `gpt-5.4-mini` | Model used for built-in AI mode |
+| `OPENAI_API_TIMEOUT` | `15` | Network timeout in seconds |
 
-If neither a custom command nor `SNAPSHOTD_AI_ENABLE=1` is set, the worker
-writes a clean deterministic message (imperative subject + bullet body).
+If neither `SNAPSHOTD_COMMIT_MESSAGE_CMD` nor `SNAPSHOTD_AI_ENABLE=1` is set,
+the worker writes deterministic commit messages.
+
+## Batch message generation
+
+Built-in AI now works as a pre-pass, not a per-event network call.
+
+When AI is enabled and the backlog is at or below
+`SNAPSHOTD_AI_MAX_QUEUE_DEPTH`, the worker does this before replaying commits:
+
+1. Find events whose `events.message` is still `NULL`
+2. Split them into chunks of `SNAPSHOTD_AI_CHUNK_SIZE`
+3. Send one structured-output request per chunk
+4. Persist returned messages into `events.message`
+5. Build commits from stored messages, falling back to deterministic messages
+   for any event whose chunk failed
+
+Why this design is better:
+
+- It cuts prompt overhead on bursts because one request covers many events.
+- It keeps replay predictable because generated messages are stored before the
+  commit loop.
+- It degrades cleanly. One bad chunk falls back to deterministic messages for
+  that chunk only.
+
+Each request uses a JSON schema. The model has to return a `messages` array,
+keyed by event `seq`. Sensitive-path redaction still happens per event before
+anything leaves the machine.
+
+### Tuning guidance
+
+| Setting | Good starting point | Why |
+|---------|---------------------|-----|
+| `SNAPSHOTD_AI_CHUNK_SIZE` | `20` | Large enough to amortize prompt overhead, small enough to keep responses manageable |
+| `SNAPSHOTD_AI_MAX_QUEUE_DEPTH` | `50` or `100` | With chunking, 100 queued events means 5 requests at chunk size 20, not 100 requests |
+| `SNAPSHOTD_COMMIT_MESSAGE_CMD` | leave unset unless you need custom logic | Custom command generation still runs once per event, so it does not benefit from batching |
+
+If you are still tuning the system, start with built-in batching. It is cheaper
+and simpler than a custom per-event command.
 
 ## Operating commands
 
 ```bash
-# Queue status for a given worktree
+# Show queue status for a repo
 python3 snapshot-worker.py --status --repo /path/to/repo
 
-# Drain pending events synchronously.
-# Exits 0 if the current-branch queue is empty, 2 if events remain.
+# Drain pending events synchronously
+# Exit 0 if the current-branch queue is empty, 2 if events remain
 python3 snapshot-worker.py --flush --repo /path/to/repo
 
-# Foreground worker (normally invoked automatically by the hook)
+# Run the worker in the foreground
 python3 snapshot-worker.py --repo /path/to/repo
 ```
 
@@ -174,35 +242,42 @@ python3 snapshot-worker.py --repo /path/to/repo
 
 ```bash
 GIT_DIR=$(git rev-parse --absolute-git-dir)
+
 tail -n 200 "$GIT_DIR/ai-snapshotd/logs/hook.log"
 tail -n 200 "$GIT_DIR/ai-snapshotd/logs/worker.log"
+
 python3 snapshot-worker.py --status --repo .
+
 sqlite3 "$GIT_DIR/ai-snapshotd/snapshotd.db" \
   "SELECT seq, state, branch_ref, tool_name, substr(commit_oid,1,8), error FROM events ORDER BY seq DESC LIMIT 20;"
 ```
 
-## Notes on security and exfiltration
+## Security notes
 
-- `SNAPSHOTD_COMMIT_MESSAGE_CMD` is `shlex.split` + `subprocess.run` with
-  a plain argv. No shell.
-- The built-in OpenAI path is off by default. To turn it on you must set
-  both `OPENAI_API_KEY` and `SNAPSHOTD_AI_ENABLE=1`. Base URL must be
-  HTTPS.
-- Diffs for paths matching `SNAPSHOTD_SENSITIVE_GLOBS` (`.env`, `*.pem`,
-  `*.key`, `secrets/*`, `credentials*`, and so on by default) are
-  replaced with a redaction marker before any network call.
-- AI messages are also skipped entirely when the backlog depth exceeds
-  `SNAPSHOTD_AI_MAX_QUEUE_DEPTH`, both for cost and for not hanging the
-  drain on network latency.
+- `SNAPSHOTD_COMMIT_MESSAGE_CMD` is parsed with `shlex.split` and executed as a
+  plain argv list. No shell involved.
+- Built-in OpenAI mode is off by default. To enable it, set both
+  `OPENAI_API_KEY` and `SNAPSHOTD_AI_ENABLE=1`.
+- `OPENAI_BASE_URL` must use `https://`.
+- Diffs for paths matching `SNAPSHOTD_SENSITIVE_GLOBS` are replaced with a
+  redaction marker before any network request.
+- If backlog depth exceeds `SNAPSHOTD_AI_MAX_QUEUE_DEPTH`, built-in AI is
+  skipped for that drain cycle.
+
+The opinionated recommendation here is simple: keep sensitive globs broad, keep
+the base URL HTTPS-only, and do not try to be clever about redaction.
 
 ## Known limitations
 
-- Unix only. Uses advisory `fcntl` locks.
-- Harnesses that don't tell the hook which file changed (e.g. Codex CLI
-  PostToolUse for non-Bash tools) cannot be captured exactly.
-- `blocked_conflict` events are recorded but not auto-retried. Their path
-  tails are cleared so subsequent edits start fresh from HEAD.
+- Unix only. The worker uses advisory `fcntl` locks.
+- Some harnesses do not report exact changed files for every tool. In those
+  cases, capture is best-effort.
+- `blocked_conflict` events are recorded, not auto-retried.
 - After a successful publish, the worker resets only the paths it just
-  committed in the live index, and only when the live index still matches
-  the pre-publish HEAD. If you have unrelated staged content for the same
-  paths, it is left alone.
+  committed, and only when the live index still matches the pre-publish HEAD.
+  If you staged different content for the same paths, it leaves that alone.
+
+## Related files
+
+- `snapshot-hook.py`
+- `snapshot-worker.py`
