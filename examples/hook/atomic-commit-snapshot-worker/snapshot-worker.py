@@ -1636,6 +1636,8 @@ def worker_loop(repo_root: Path, git_dir: Path) -> int:
                 interruptible_sleep(POLL_SECONDS)
                 continue
 
+            retry_deferred_reconcile(conn, repo_root, branch)
+
             pending = fetch_pending(conn, branch)
             if not pending:
                 if idle_since is None:
@@ -1729,6 +1731,7 @@ def cmd_flush(repo_root: Path, git_dir: Path) -> int:
             if branch is None:
                 print("detached HEAD, nothing to flush", file=sys.stderr)
                 return 1
+            retry_deferred_reconcile(conn, repo_root, branch)
             for _ in range(20):
                 result = replay_batch(conn, repo_root, git_dir, branch)
                 if result == 0:
@@ -1736,6 +1739,8 @@ def cmd_flush(repo_root: Path, git_dir: Path) -> int:
                 if result == -1:
                     time.sleep(0.1)
                     continue
+                retry_deferred_reconcile(conn, repo_root, branch)
+            retry_deferred_reconcile(conn, repo_root, branch)
             remaining = pending_count_for_branch(conn, branch)
             if remaining > 0:
                 print(
