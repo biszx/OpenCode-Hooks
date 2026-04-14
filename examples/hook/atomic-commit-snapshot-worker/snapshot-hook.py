@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS events (
   state             TEXT NOT NULL DEFAULT 'pending',
   commit_oid        TEXT,
   target_commit_oid TEXT,
+  message           TEXT,
   settled_ts        REAL,
   error             TEXT
 );
@@ -144,6 +145,11 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     if "target_commit_oid" not in existing:
         try:
             conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "message" not in existing:
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN message TEXT")
         except sqlite3.OperationalError:
             pass
 
