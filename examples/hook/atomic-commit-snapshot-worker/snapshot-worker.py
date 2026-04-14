@@ -1538,7 +1538,17 @@ def replay_batch(
     for _seq, _oid, ops in prepared:
         for p in paths_touched(ops):
             touched.append(p)
-    reconcile_live_index(repo_root, head_state, touched)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        queue_reconcile_paths(conn, branch, head_state, touched)
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+    retry_deferred_reconcile(conn, repo_root, branch)
     debug(f"published {len(prepared)} commit(s) to {branch}: tip={final_parent}")
     return len(prepared)
 
