@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""
-Singleton snapshot worker.
+"""Drain queued snapshot events and publish real commits.
 
-Runs per worktree / git-dir. Drains the SQLite journal, replays pending events
-onto the current branch tip, publishes with compare-and-swap via
-`git update-ref`, and exits after an idle window.
+This worker runs once per worktree or git dir. It reads pending events from the
+SQLite queue, replays them onto the current branch tip with a temporary git
+index, then publishes the result with ``git update-ref`` compare-and-swap.
+When the queue stays idle long enough, it exits.
 
-Crash safety
-------------
-Publishing is two-phase. Before calling `update-ref`, all events in the batch
-are marked `publishing` with their target commit OIDs persisted. On startup,
-any leftover `publishing` rows are reconciled by checking whether their
-target commit is an ancestor of the branch tip (published) or not (pending
-again).
+Crash safety is two-phase. Before moving the branch, the worker marks each
+prepared event as ``publishing`` and stores its target commit OID. On startup,
+any leftover ``publishing`` rows are reconciled by checking whether that target
+commit already landed in branch history.
 
-Batching
---------
-The replay keeps the index state in Python memory. Reads use one
-`git ls-files -s -z`. Writes go out as a single `git update-index -z
---index-info` per event. Blob content for diffs is read through
-`git cat-file --batch`. AI commit messages are only generated when the
-pending backlog is shallow; otherwise deterministic messages are used.
+Replay is batched on purpose. The worker keeps index state in memory, reads the
+index with one ``git ls-files -s -z`` call, applies each event with one
+``git update-index -z --index-info`` call, and fetches blob contents for diffs
+through ``git cat-file --batch``.
+
+Built-in AI commit messages are also batched now. When AI is enabled and the
+backlog is within ``SNAPSHOTD_AI_MAX_QUEUE_DEPTH``, the worker generates and
+stores messages in chunks before the commit loop. If AI is off, skipped, or a
+chunk fails, it falls back to deterministic messages for the affected events.
 """
 
 from __future__ import annotations
