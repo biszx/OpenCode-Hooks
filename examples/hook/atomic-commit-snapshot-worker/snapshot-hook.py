@@ -5,27 +5,10 @@ Universal snapshot autocommit hook.
 Reads any harness-specific PostToolUse / file-change JSON on stdin, normalizes
 it, captures an immutable git blob snapshot for each changed file, inserts one
 event row into a SQLite database living inside this worktree's private git
-dir, then spawns the singleton worker.
+dir, then wakes (or spawns) the singleton worker.
 
-Design
-------
-- DB is truth. The hidden-ref worker is replaced by plain journal-first events.
-- DB lives at <git-dir>/ai-snapshotd/snapshotd.db. Because git rev-parse
-  --absolute-git-dir returns the worktree's private git dir, every worktree
-  (main or linked) automatically gets its own isolated DB and its own worker.
-- path_tail chains repeated edits to the same file so 10 fast edits produce
-  10 replayable commits in the same order.
-- The hook does only fast work: parse, snapshot, insert, spawn. The worker
-  handles quiet-window batching, commit-tree construction, and CAS publish.
-
-Supported harnesses (all via stdin JSON):
-- Claude Code PostToolUse: tool_input.file_path for Write|Edit|MultiEdit|NotebookEdit
-- OpenCode file.changed plugin events: changes[] / files[]
-- Codex / generic: best-effort extraction from common payload shapes
-
-Env:
-- SNAPSHOTD_DEBUG=1                enables /tmp/snapshotd-hook.log
-- SNAPSHOTD_WORKER_PATH=<path>     override the worker script path
+All path_tail reads and writes happen inside one BEGIN IMMEDIATE transaction,
+so concurrent hooks for the same path cannot capture the same `before` state.
 """
 
 from __future__ import annotations
@@ -33,6 +16,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -42,8 +26,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DB_SUBPATH = "ai-snapshotd/snapshotd.db"
-DEBUG_LOG = Path("/tmp/snapshotd-hook.log")
+STATE_SUBDIR = "ai-snapshotd"
+DB_SUBPATH = f"{STATE_SUBDIR}/snapshotd.db"
+LOG_SUBPATH = f"{STATE_SUBDIR}/logs/hook.log"
+LOG_MAX_BYTES = int(os.environ.get("SNAPSHOTD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+LOG_KEEP = int(os.environ.get("SNAPSHOTD_LOG_KEEP", "3"))
+WORKER_HEARTBEAT_STALE = float(os.environ.get("SNAPSHOTD_HEARTBEAT_STALE", "15"))
 DEBUG = os.environ.get("SNAPSHOTD_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
 
@@ -54,17 +42,18 @@ PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS events (
-  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-  branch_ref   TEXT NOT NULL,
-  base_head    TEXT NOT NULL,
-  session_id   TEXT,
-  tool_name    TEXT,
-  source       TEXT,
-  captured_ts  REAL NOT NULL,
-  state        TEXT NOT NULL DEFAULT 'pending',
-  commit_oid   TEXT,
-  settled_ts   REAL,
-  error        TEXT
+  seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+  branch_ref        TEXT NOT NULL,
+  base_head         TEXT NOT NULL,
+  session_id        TEXT,
+  tool_name         TEXT,
+  source            TEXT,
+  captured_ts       REAL NOT NULL,
+  state             TEXT NOT NULL DEFAULT 'pending',
+  commit_oid        TEXT,
+  target_commit_oid TEXT,
+  settled_ts        REAL,
+  error             TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_state_seq ON events(state, seq);
@@ -108,15 +97,65 @@ VALUES (1, 0, 0, 0, 0);
 """
 
 
-def debug(message: str) -> None:
-    if not DEBUG:
+def _rotate_log(path: Path) -> None:
+    try:
+        if path.stat().st_size < LOG_MAX_BYTES:
+            return
+    except OSError:
         return
     try:
-        DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with DEBUG_LOG.open("a", encoding="utf-8") as fh:
+        for i in range(LOG_KEEP, 0, -1):
+            src = path.with_suffix(path.suffix + f".{i}")
+            dst = path.with_suffix(path.suffix + f".{i + 1}")
+            if src.exists():
+                if i == LOG_KEEP:
+                    src.unlink(missing_ok=True)
+                else:
+                    src.replace(dst)
+        path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
+
+
+def _log(log_path: Optional[Path], message: str) -> None:
+    if not DEBUG:
+        return
+    target = log_path
+    if target is None:
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_log(target)
+        with target.open("a", encoding="utf-8") as fh:
             fh.write(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {message}\n")
     except Exception:
         pass
+
+
+_LOG_PATH: Optional[Path] = None
+
+
+def debug(message: str) -> None:
+    _log(_LOG_PATH, message)
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "target_commit_oid" not in existing:
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+
+def open_db(git_dir: Path) -> sqlite3.Connection:
+    db_path = git_dir / DB_SUBPATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+    migrate_schema(conn)
+    return conn
 
 
 def run_git(cwd: Path, *args: str, input_bytes: Optional[bytes] = None) -> str:
@@ -133,6 +172,20 @@ def run_git(cwd: Path, *args: str, input_bytes: Optional[bytes] = None) -> str:
             or f"git {' '.join(args)} failed"
         )
     return proc.stdout.decode("utf-8", errors="replace").rstrip("\n")
+
+
+def maybe_git(cwd: Path, *args: str) -> Tuple[int, str, str]:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return (
+        proc.returncode,
+        proc.stdout.decode("utf-8", errors="replace").rstrip("\n"),
+        proc.stderr.decode("utf-8", errors="replace").rstrip("\n"),
+    )
 
 
 def resolve_cwd(payload: Dict[str, Any]) -> Path:
@@ -156,7 +209,7 @@ def resolve_repo(cwd: Path) -> Tuple[Path, Path]:
 def rel_path(repo_root: Path, candidate: str) -> Optional[str]:
     p = Path(candidate)
     if not p.is_absolute():
-        p = (repo_root / p)
+        p = repo_root / p
     try:
         resolved = p.resolve(strict=False)
         return resolved.relative_to(repo_root.resolve()).as_posix()
@@ -165,7 +218,6 @@ def rel_path(repo_root: Path, candidate: str) -> Optional[str]:
 
 
 def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, Any]]:
-    """Return normalized ops: [{op, path[, old_path]}, ...]"""
     ops: List[Dict[str, Any]] = []
     seen: set = set()
 
@@ -185,7 +237,6 @@ def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, 
             entry["old_path"] = old_rel
         ops.append(entry)
 
-    # OpenCode file.changed
     if payload.get("event") == "file.changed":
         for item in payload.get("changes") or []:
             if not isinstance(item, dict):
@@ -200,7 +251,6 @@ def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, 
                 add("modify", f)
         return ops
 
-    # Claude Code PostToolUse style
     tool_name = str(payload.get("tool_name") or "").strip()
     tool_input = payload.get("tool_input") or {}
     if tool_name and isinstance(tool_input, dict):
@@ -214,13 +264,15 @@ def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, 
             if isinstance(fp, str):
                 add("modify", fp)
         elif lower in {"move", "rename"}:
-            add("rename", tool_input.get("to_path") or tool_input.get("destination"),
-                tool_input.get("from_path") or tool_input.get("source"))
+            add(
+                "rename",
+                tool_input.get("to_path") or tool_input.get("destination"),
+                tool_input.get("from_path") or tool_input.get("source"),
+            )
 
     if ops:
         return ops
 
-    # Generic fallback: scan common fields
     for key in ("file_path", "path", "filepath", "filename"):
         value = payload.get(key)
         if isinstance(value, str):
@@ -249,129 +301,202 @@ def hash_object(repo_root: Path, abs_path: Path) -> Tuple[Optional[str], Optiona
     if mode is None:
         return None, None
     if mode == "120000":
-        target = os.readlink(abs_path)
-        oid = run_git(repo_root, "hash-object", "-w", "--stdin",
-                      input_bytes=target.encode("utf-8"))
+        try:
+            target = os.readlink(abs_path)
+        except OSError as exc:
+            debug(f"readlink failed for {abs_path}: {exc}")
+            return None, None
+        try:
+            oid = run_git(
+                repo_root, "hash-object", "-w", "--stdin",
+                input_bytes=target.encode("utf-8", errors="replace"),
+            )
+        except RuntimeError as exc:
+            debug(f"hash-object symlink failed for {abs_path}: {exc}")
+            return None, None
         return oid, mode
-    oid = run_git(repo_root, "hash-object", "-w", str(abs_path))
+    try:
+        oid = run_git(repo_root, "hash-object", "-w", str(abs_path))
+    except RuntimeError as exc:
+        debug(f"hash-object failed for {abs_path}: {exc}")
+        return None, None
     return oid, mode
 
 
-def ls_tree_path(repo_root: Path, rev: str, rel: str) -> Tuple[Optional[str], Optional[str]]:
-    proc = subprocess.run(
-        ["git", "ls-tree", rev, "--", rel],
-        cwd=str(repo_root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        return None, None
-    out = proc.stdout.decode("utf-8", errors="replace").strip()
-    if not out:
-        return None, None
-    meta, _tab, path_part = out.splitlines()[0].partition("\t")
-    if path_part != rel:
-        return None, None
-    parts = meta.split()
-    if len(parts) < 3:
-        return None, None
-    return parts[2], parts[0]
+def batch_ls_tree(repo_root: Path, rev: str, paths: List[str]) -> Dict[str, Tuple[str, str]]:
+    """One `git ls-tree -z` call for many paths. Returns {path: (oid, mode)}."""
+    if not paths:
+        return {}
+    out: Dict[str, Tuple[str, str]] = {}
+    try:
+        code, stdout, _err = maybe_git(repo_root, "ls-tree", "-z", rev, "--", *paths)
+        if code != 0 or not stdout:
+            return out
+    except Exception as exc:  # noqa: BLE001
+        debug(f"ls-tree batch failed: {exc}")
+        return out
+    for entry in stdout.split("\x00"):
+        if not entry:
+            continue
+        meta, _tab, path_part = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3:
+            continue
+        mode, _kind, oid = parts[0], parts[1], parts[2]
+        out[path_part] = (oid, mode)
+    return out
 
 
-def open_db(git_dir: Path) -> sqlite3.Connection:
-    db_path = git_dir / DB_SUBPATH
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA_SQL)
-    return conn
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
 
 
-def read_tail(conn: sqlite3.Connection, branch: str, path: str) -> Tuple[Optional[str], Optional[str]]:
+def wake_or_spawn_worker(
+    conn: sqlite3.Connection, git_dir: Path, repo_root: Path
+) -> None:
+    """Prefer signalling an already-alive worker over spawning a new one."""
     row = conn.execute(
-        "SELECT tail_oid, tail_mode FROM path_tail WHERE branch_ref=? AND path=?",
-        (branch, path),
+        "SELECT pid, heartbeat_ts FROM worker_state WHERE id=1"
     ).fetchone()
-    if row is None:
-        return None, None
-    return row["tail_oid"], row["tail_mode"]
+    if row:
+        pid = int(row["pid"] or 0)
+        hb = float(row["heartbeat_ts"] or 0.0)
+        if pid > 0 and time.time() - hb < WORKER_HEARTBEAT_STALE and _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                debug(f"signalled existing worker pid={pid}")
+                return
+            except OSError as exc:
+                debug(f"signal to {pid} failed: {exc}; will spawn")
+
+    worker_path = os.environ.get("SNAPSHOTD_WORKER_PATH")
+    if not worker_path:
+        worker_path = str(Path(__file__).resolve().with_name("snapshot-worker.py"))
+    try:
+        subprocess.Popen(
+            [sys.executable, worker_path, "--repo", str(repo_root), "--git-dir", str(git_dir)],
+            cwd=str(repo_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+        debug("spawned worker")
+    except OSError as exc:
+        debug(f"failed to spawn worker: {exc}")
 
 
-def snapshot_op(
-    repo_root: Path,
+def detect_source(payload: Dict[str, Any]) -> str:
+    if payload.get("event") == "file.changed":
+        return "opencode"
+    if "tool_name" in payload and "tool_input" in payload:
+        if "hook_event_name" in payload or "transcript_path" in payload:
+            return "claude"
+        return "tool-hook"
+    return "generic"
+
+
+def _resolve_before(
     conn: sqlite3.Connection,
     branch: str,
-    base_head: str,
-    op: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    kind = op["op"]
-    path = op["path"]
-    abs_path = repo_root / path
+    path: str,
+    head_entries: Dict[str, Tuple[str, str]],
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Return (before_oid, before_mode, tail_source_seq)."""
+    row = conn.execute(
+        "SELECT tail_oid, tail_mode, source_seq FROM path_tail WHERE branch_ref=? AND path=?",
+        (branch, path),
+    ).fetchone()
+    if row is not None:
+        return row["tail_oid"], row["tail_mode"], int(row["source_seq"])
+    head = head_entries.get(path)
+    if head is None:
+        return None, None, None
+    return head[0], head[1], None
 
-    # Compute "before" from unpublished tail, else from base_head
-    before_source = "tail"
-    before_oid, before_mode = read_tail(conn, branch, path)
-    if before_oid is None and before_mode is None:
-        before_source = "head"
-        before_oid, before_mode = ls_tree_path(repo_root, base_head, path)
+
+def _build_op(
+    conn: sqlite3.Connection,
+    branch: str,
+    change: Dict[str, Any],
+    hashes: Dict[str, Tuple[str, str]],
+    head_entries: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[Dict[str, Any], List[int]]]:
+    """Return (op_row, observed_tail_source_seqs) for CAS tracking."""
+    kind = change["op"]
+    path = change["path"]
+    observed: List[int] = []
 
     if kind in {"create", "modify"}:
-        after_oid, after_mode = hash_object(repo_root, abs_path)
-        if after_oid is None:
-            debug(f"skip missing {kind}: {path}")
+        after = hashes.get(path)
+        if after is None:
             return None
-        effective_kind = "create" if before_oid is None else "modify"
-        return {
-            "op": effective_kind,
+        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, path, head_entries)
+        if tail_seq is not None:
+            observed.append(tail_seq)
+        effective = "create" if before_oid is None else "modify"
+        return ({
+            "op": effective,
             "path": path,
             "before_oid": before_oid,
             "before_mode": before_mode,
-            "after_oid": after_oid,
-            "after_mode": after_mode,
-        }
+            "after_oid": after[0],
+            "after_mode": after[1],
+        }, observed)
 
     if kind == "delete":
+        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, path, head_entries)
+        if tail_seq is not None:
+            observed.append(tail_seq)
         if before_oid is None:
-            debug(f"skip delete with no prior state: {path}")
             return None
-        return {
+        return ({
             "op": "delete",
             "path": path,
             "before_oid": before_oid,
             "before_mode": before_mode,
             "after_oid": None,
             "after_mode": None,
-        }
+        }, observed)
 
     if kind == "rename":
-        old_path = op.get("old_path")
+        old_path = change.get("old_path")
         if not old_path:
             return None
-        old_before_oid, old_before_mode = read_tail(conn, branch, old_path)
-        if old_before_oid is None and old_before_mode is None:
-            old_before_oid, old_before_mode = ls_tree_path(repo_root, base_head, old_path)
-        if old_before_oid is None:
-            debug(f"skip rename from missing source: {old_path} -> {path}")
+        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, old_path, head_entries)
+        if tail_seq is not None:
+            observed.append(tail_seq)
+        if before_oid is None:
             return None
-        after_oid, after_mode = hash_object(repo_root, abs_path)
-        if after_oid is None:
+        after = hashes.get(path)
+        if after is None:
             return None
-        return {
+        # Also track target-path tail, in case a prior event referenced it.
+        _tgt_oid, _tgt_mode, tgt_seq = _resolve_before(conn, branch, path, head_entries)
+        if tgt_seq is not None:
+            observed.append(tgt_seq)
+        return ({
             "op": "rename",
             "path": path,
             "old_path": old_path,
-            "before_oid": old_before_oid,
-            "before_mode": old_before_mode,
-            "after_oid": after_oid,
-            "after_mode": after_mode,
-        }
+            "before_oid": before_oid,
+            "before_mode": before_mode,
+            "after_oid": after[0],
+            "after_mode": after[1],
+        }, observed)
 
-    _ = before_source
     debug(f"unsupported op: {kind}")
     return None
 
 
-def insert_event(
+def insert_event_and_tails(
     conn: sqlite3.Connection,
     branch: str,
     base_head: str,
@@ -382,30 +507,23 @@ def insert_event(
 ) -> int:
     now = time.time()
     cur = conn.execute(
-        """INSERT INTO events(branch_ref, base_head, session_id, tool_name, source, captured_ts, state)
+        """INSERT INTO events(branch_ref, base_head, session_id, tool_name, source,
+                              captured_ts, state)
            VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
         (branch, base_head, session_id, tool_name, source, now),
     )
-    seq = cur.lastrowid
+    seq = int(cur.lastrowid)
     for ord_idx, op in enumerate(ops):
         conn.execute(
             """INSERT INTO event_ops(event_seq, ord, op, path, old_path,
                                       before_oid, before_mode, after_oid, after_mode)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                seq,
-                ord_idx,
-                op["op"],
-                op["path"],
-                op.get("old_path"),
-                op.get("before_oid"),
-                op.get("before_mode"),
-                op.get("after_oid"),
-                op.get("after_mode"),
+                seq, ord_idx, op["op"], op["path"], op.get("old_path"),
+                op.get("before_oid"), op.get("before_mode"),
+                op.get("after_oid"), op.get("after_mode"),
             ),
         )
-        # Update tail to the new after-state for this path
-        target_path = op["path"]
         conn.execute(
             """INSERT INTO path_tail(branch_ref, path, tail_oid, tail_mode, source_seq)
                VALUES (?, ?, ?, ?, ?)
@@ -413,9 +531,8 @@ def insert_event(
                  tail_oid=excluded.tail_oid,
                  tail_mode=excluded.tail_mode,
                  source_seq=excluded.source_seq""",
-            (branch, target_path, op.get("after_oid"), op.get("after_mode"), seq),
+            (branch, op["path"], op.get("after_oid"), op.get("after_mode"), seq),
         )
-        # For rename: old_path becomes absent
         if op["op"] == "rename" and op.get("old_path"):
             conn.execute(
                 """INSERT INTO path_tail(branch_ref, path, tail_oid, tail_mode, source_seq)
@@ -431,43 +548,16 @@ def insert_event(
     return seq
 
 
-def spawn_worker(git_dir: Path, repo_root: Path) -> None:
-    worker_path = os.environ.get("SNAPSHOTD_WORKER_PATH")
-    if not worker_path:
-        worker_path = str(Path(__file__).resolve().with_name("snapshot-worker.py"))
-    try:
-        subprocess.Popen(
-            [sys.executable, worker_path, "--repo", str(repo_root), "--git-dir", str(git_dir)],
-            cwd=str(repo_root),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            env=os.environ.copy(),
-        )
-    except OSError as exc:
-        debug(f"failed to spawn worker: {exc}")
-
-
-def detect_source(payload: Dict[str, Any]) -> str:
-    if payload.get("event") == "file.changed":
-        return "opencode"
-    if "tool_name" in payload and "tool_input" in payload:
-        if "hook_event_name" in payload or "transcript_path" in payload:
-            return "claude"
-        return "tool-hook"
-    return "generic"
-
-
 def handle_payload(payload: Dict[str, Any]) -> int:
+    global _LOG_PATH
     cwd = resolve_cwd(payload)
     try:
         repo_root, git_dir = resolve_repo(cwd)
     except RuntimeError as exc:
         debug(f"not a git repo: {cwd}: {exc}")
         return 0
+    _LOG_PATH = git_dir / LOG_SUBPATH
 
-    # Resolve branch + base head once per payload
     try:
         branch = run_git(repo_root, "symbolic-ref", "-q", "HEAD").strip()
     except RuntimeError:
@@ -486,33 +576,106 @@ def handle_payload(payload: Dict[str, Any]) -> int:
         debug("no changes extracted")
         return 0
 
+    # Hash all files (expensive, outside tx). Skip individual failures.
+    hashes: Dict[str, Tuple[str, str]] = {}
+    survivors: List[Dict[str, Any]] = []
+    for change in changes:
+        try:
+            target = change["path"]
+            if change["op"] in {"create", "modify", "rename"}:
+                result = hash_object(repo_root, repo_root / target)
+                if result[0] is None:
+                    if change["op"] == "rename":
+                        debug(f"skip rename (missing target): {target}")
+                    else:
+                        debug(f"skip missing path: {target}")
+                    continue
+                hashes[target] = result
+            survivors.append(change)
+        except Exception as exc:  # noqa: BLE001
+            debug(f"per-file capture failed for {change.get('path')}: {exc}")
+            continue
+
+    if not survivors:
+        return 0
+
+    # Batch HEAD lookups for all candidate paths (source + rename source).
+    head_paths: List[str] = []
+    seen_paths: set = set()
+    for change in survivors:
+        for key in ("path", "old_path"):
+            value = change.get(key)
+            if isinstance(value, str) and value not in seen_paths:
+                seen_paths.add(value)
+                head_paths.append(value)
+    head_entries = batch_ls_tree(repo_root, base_head, head_paths)
+
     conn = open_db(git_dir)
     try:
-        ops: List[Dict[str, Any]] = []
-        for change in changes:
-            op = snapshot_op(repo_root, conn, branch, base_head, change)
-            if op is not None:
-                ops.append(op)
-        if not ops:
-            debug("no valid ops after snapshot")
-            return 0
-
         session_id = str(payload.get("session_id") or "")
         tool_name = str(payload.get("tool_name") or "")
         source = detect_source(payload)
 
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            seq = insert_event(conn, branch, base_head, session_id, tool_name, source, ops)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        debug(f"queued event seq={seq} ops={len(ops)} branch={branch}")
+        # CAS loop: re-read path_tail under BEGIN IMMEDIATE; if a concurrent
+        # hook bumped source_seq for any observed tail, retry from scratch.
+        for attempt in range(6):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ops: List[Dict[str, Any]] = []
+                observed: List[int] = []
+                for change in survivors:
+                    built = _build_op(conn, branch, change, hashes, head_entries)
+                    if built is None:
+                        continue
+                    ops.append(built[0])
+                    observed.extend(built[1])
+                if not ops:
+                    conn.execute("ROLLBACK")
+                    return 0
+
+                # Verify observed source_seqs are still current before we commit.
+                stale = False
+                for seq in observed:
+                    check = conn.execute(
+                        "SELECT 1 FROM path_tail WHERE source_seq=?",
+                        (seq,),
+                    ).fetchone()
+                    if check is None:
+                        stale = True
+                        break
+                if stale:
+                    conn.execute("ROLLBACK")
+                    debug(f"path_tail shifted under us, retry {attempt + 1}")
+                    time.sleep(0.005 * (attempt + 1))
+                    continue
+
+                new_seq = insert_event_and_tails(
+                    conn, branch, base_head, session_id, tool_name, source, ops
+                )
+                conn.execute("COMMIT")
+                debug(f"queued event seq={new_seq} ops={len(ops)} branch={branch}")
+                break
+            except sqlite3.OperationalError as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                debug(f"sqlite busy (attempt {attempt + 1}): {exc}")
+                time.sleep(0.01 * (attempt + 1))
+                continue
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+        else:
+            debug("gave up after repeated path_tail conflicts")
+            return 0
+
+        wake_or_spawn_worker(conn, git_dir, repo_root)
     finally:
         conn.close()
-
-    spawn_worker(git_dir, repo_root)
     return 0
 
 
@@ -523,14 +686,14 @@ def main() -> int:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        debug(f"invalid JSON: {exc}")
+        _log(_LOG_PATH, f"invalid JSON: {exc}")
         return 0
     if not isinstance(payload, dict):
         return 0
     try:
         return handle_payload(payload)
     except Exception as exc:  # noqa: BLE001
-        debug(f"hook error: {exc}")
+        _log(_LOG_PATH, f"hook error: {exc}")
         return 0
 
 
