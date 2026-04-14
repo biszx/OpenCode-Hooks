@@ -378,64 +378,130 @@ def apply_ops_to_index(
 
 
 def reconcile_live_index(
+    conn: sqlite3.Connection,
+    branch: str,
     repo_root: Path,
     pre_publish_head_entries: Dict[str, Tuple[str, str]],
     paths: List[str],
-) -> None:
+) -> bool:
     """Reset only paths whose live index entry still matches pre-publish HEAD.
-    If the user has staged something different for a touched path, skip it —
-    leave their staged state alone.
+    If the live index is transiently locked, leave the paths queued for retry.
+    If the user staged something else meanwhile, skip that path permanently.
     """
     if not paths:
-        return
+        return True
+
     live_env = os.environ.copy()
     live_env.pop("GIT_INDEX_FILE", None)
     unique = sorted(set(paths))
-    proc = subprocess.run(
-        ["git", "ls-files", "-s", "-z", "--", *unique],
-        cwd=str(repo_root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=live_env,
-    )
-    if proc.returncode != 0:
-        debug("reconcile: live ls-files failed; skipping")
-        return
-    live: Dict[str, Tuple[str, str]] = {}
-    for chunk in proc.stdout.split(b"\x00"):
-        if not chunk:
-            continue
-        meta_bytes, _tab, path_bytes = chunk.partition(b"\t")
-        path = path_bytes.decode("utf-8", errors="replace")
-        parts = meta_bytes.split()
-        if len(parts) < 2:
-            continue
-        live[path] = (parts[0].decode(), parts[1].decode())
 
-    safe_paths: List[str] = []
-    for path in unique:
-        pre = pre_publish_head_entries.get(path)
-        here = live.get(path)
-        if pre is None and here is None:
-            continue
-        if pre is None and here is not None:
-            # user staged something newly; don't touch it
-            debug(f"reconcile: skip {path} (newly staged)")
-            continue
-        if pre is not None and here is None:
-            # user unstaged; reset will re-materialize HEAD entry
-            safe_paths.append(path)
-            continue
-        if pre == here:
-            safe_paths.append(path)
-        else:
-            debug(f"reconcile: skip {path} (staged diverges from HEAD)")
+    for attempt in range(RECONCILE_RETRY_ATTEMPTS):
+        code, out, err = maybe_git(
+            repo_root, "ls-files", "-s", "-z", "--", *unique, env=live_env
+        )
+        if code != 0:
+            if "index.lock" in err:
+                debug(
+                    f"reconcile: live ls-files blocked by index.lock "
+                    f"(attempt {attempt + 1}/{RECONCILE_RETRY_ATTEMPTS})"
+                )
+                if attempt + 1 < RECONCILE_RETRY_ATTEMPTS:
+                    time.sleep(RECONCILE_RETRY_SLEEP * (attempt + 1))
+                    continue
+                return False
+            debug(f"reconcile: live ls-files failed: {err}")
+            return False
 
-    if not safe_paths:
-        return
-    code, _out, err = maybe_git(repo_root, "reset", "-q", "--", *safe_paths)
-    if code != 0:
-        debug(f"reconcile reset soft-failed: {err}")
+        live: Dict[str, Tuple[str, str]] = {}
+        for chunk in out.encode("utf-8", errors="replace").split(b"\x00"):
+            if not chunk:
+                continue
+            meta_bytes, _tab, path_bytes = chunk.partition(b"\t")
+            path = path_bytes.decode("utf-8", errors="replace")
+            parts = meta_bytes.split()
+            if len(parts) < 2:
+                continue
+            live[path] = (parts[0].decode(), parts[1].decode())
+
+        safe_paths: List[str] = []
+        completed_paths: List[str] = []
+        for path in unique:
+            pre = pre_publish_head_entries.get(path)
+            here = live.get(path)
+            if pre is None and here is None:
+                completed_paths.append(path)
+                continue
+            if pre is None and here is not None:
+                debug(f"reconcile: skip {path} (newly staged)")
+                completed_paths.append(path)
+                continue
+            if pre is not None and here is None:
+                safe_paths.append(path)
+                continue
+            if pre == here:
+                safe_paths.append(path)
+            else:
+                debug(f"reconcile: skip {path} (staged diverges from HEAD)")
+                completed_paths.append(path)
+
+        if not safe_paths:
+            if completed_paths:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    clear_reconcile_paths(conn, branch, completed_paths)
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
+                    raise
+            return True
+
+        code, _out, err = maybe_git(repo_root, "reset", "-q", "--", *safe_paths)
+        if code != 0:
+            if "index.lock" in err:
+                debug(
+                    f"reconcile reset deferred due to index.lock "
+                    f"(attempt {attempt + 1}/{RECONCILE_RETRY_ATTEMPTS})"
+                )
+                if attempt + 1 < RECONCILE_RETRY_ATTEMPTS:
+                    time.sleep(RECONCILE_RETRY_SLEEP * (attempt + 1))
+                    continue
+                return False
+            debug(f"reconcile reset failed: {err}")
+            return False
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            clear_reconcile_paths(conn, branch, [*completed_paths, *safe_paths])
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return True
+
+    return False
+
+
+def retry_deferred_reconcile(
+    conn: sqlite3.Connection, repo_root: Path, branch: str
+) -> bool:
+    rows = fetch_reconcile_pending(conn, branch)
+    if not rows:
+        return True
+    pre_publish_head_entries: Dict[str, Tuple[str, str]] = {}
+    for row in rows:
+        if row["pre_mode"] is not None and row["pre_oid"] is not None:
+            pre_publish_head_entries[row["path"]] = (row["pre_mode"], row["pre_oid"])
+    paths = [row["path"] for row in rows]
+    ok = reconcile_live_index(conn, branch, repo_root, pre_publish_head_entries, paths)
+    if not ok:
+        debug(f"reconcile: deferred cleanup still pending for {len(paths)} path(s)")
+    return ok
 
 
 # --------------------------------------------------------------------------- #
