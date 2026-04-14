@@ -70,10 +70,12 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 OPENAI_API_TIMEOUT = float(os.environ.get("OPENAI_API_TIMEOUT", "15"))
 
 SENSITIVE_PATTERNS = tuple(
-    p.strip() for p in os.environ.get(
+    p.strip()
+    for p in os.environ.get(
         "SNAPSHOTD_SENSITIVE_GLOBS",
         ".env,.env.*,**/.env,**/.env.*,**/id_rsa*,**/*.pem,**/*.key,**/*.p12,**/*.pfx,**/secrets/*,**/credentials*",
-    ).split(",") if p.strip()
+    ).split(",")
+    if p.strip()
 )
 
 AI_SYSTEM_PROMPT = (
@@ -303,7 +305,9 @@ def is_ancestor(repo_root: Path, commit: str, descendant: str) -> bool:
     return code == 0
 
 
-def read_index_state(repo_root: Path, env: Dict[str, str]) -> Dict[str, Tuple[str, str]]:
+def read_index_state(
+    repo_root: Path, env: Dict[str, str]
+) -> Dict[str, Tuple[str, str]]:
     """Return {path: (mode, oid)} from a git index. NUL-safe."""
     proc = subprocess.run(
         ["git", "ls-files", "-s", "-z"],
@@ -359,8 +363,12 @@ def apply_ops_to_index(
         return
     payload = b"\x00".join(chunks) + b"\x00"
     code, _out, err = maybe_git(
-        repo_root, "update-index", "-z", "--index-info",
-        env=env, input_bytes=payload,
+        repo_root,
+        "update-index",
+        "-z",
+        "--index-info",
+        env=env,
+        input_bytes=payload,
     )
     if code != 0:
         raise RuntimeError(f"update-index --index-info failed: {err}")
@@ -484,9 +492,7 @@ def pending_count_for_branch(conn: sqlite3.Connection, branch: str) -> int:
 
 
 def latest_enqueue(conn: sqlite3.Connection) -> float:
-    row = conn.execute(
-        "SELECT last_enqueue_ts FROM worker_state WHERE id=1"
-    ).fetchone()
+    row = conn.execute("SELECT last_enqueue_ts FROM worker_state WHERE id=1").fetchone()
     return float(row["last_enqueue_ts"] or 0.0) if row else 0.0
 
 
@@ -605,6 +611,7 @@ def recover_publishing(conn: sqlite3.Connection, repo_root: Path) -> None:
 
 def _path_matches_sensitive(path: str) -> bool:
     from fnmatch import fnmatch
+
     for pattern in SENSITIVE_PATTERNS:
         if fnmatch(path, pattern):
             return True
@@ -801,8 +808,12 @@ def sanitize_message(text: str) -> str:
     for bullet in body:
         wrapped.extend(
             textwrap.wrap(
-                bullet, width=72, initial_indent="- ", subsequent_indent="  ",
-                break_long_words=False, break_on_hyphens=False,
+                bullet,
+                width=72,
+                initial_indent="- ",
+                subsequent_indent="  ",
+                break_long_words=False,
+                break_on_hyphens=False,
             )
         )
     return subject + "\n\n" + "\n".join(wrapped)
@@ -926,9 +937,7 @@ def _build_batch_event_payload(
             and op.get("old_path")
             and _path_matches_sensitive(op["old_path"])
         )
-        diff_text = (
-            "<redacted: sensitive path>" if redact else diffs.get(idx, "")
-        )
+        diff_text = "<redacted: sensitive path>" if redact else diffs.get(idx, "")
         op_entries.append(
             {
                 "op": op["op"],
@@ -1034,8 +1043,7 @@ def batch_ai_messages(
                 raise ValueError("messages is not a list")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             debug(
-                f"openai batch structured output invalid for seqs "
-                f"{chunk_seqs}: {exc}"
+                f"openai batch structured output invalid for seqs {chunk_seqs}: {exc}"
             )
             continue
 
@@ -1068,14 +1076,13 @@ def build_message(
     event: sqlite3.Row,
     ops: List[Dict[str, Any]],
     diffs: Dict[int, str],
-    use_ai: bool,
     stored_message: Optional[str] = None,
 ) -> str:
     if stored_message:
         stripped = stored_message.strip()
         if stripped:
             return stripped
-    if use_ai and COMMIT_CMD:
+    if COMMIT_CMD:
         try:
             msg = ai_message_via_command(event, ops, diffs)
             if msg:
@@ -1106,12 +1113,16 @@ def ops_as_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     ]
 
 
-def verify_op_applies(op: Dict[str, Any], state: Dict[str, Tuple[str, str]]) -> Optional[str]:
+def verify_op_applies(
+    op: Dict[str, Any], state: Dict[str, Tuple[str, str]]
+) -> Optional[str]:
     kind = op["op"]
     path = op["path"]
     if kind == "create":
         here = state.get(path)
-        if here is not None and (here[1] != op["after_oid"] or here[0] != op["after_mode"]):
+        if here is not None and (
+            here[1] != op["after_oid"] or here[0] != op["after_mode"]
+        ):
             return f"create target already exists with different content: {path}"
         return None
     if kind == "modify":
@@ -1210,26 +1221,29 @@ def replay_batch(
         state: Dict[str, Tuple[str, str]] = dict(head_state)
 
         backlog = pending_count_for_branch(conn, branch)
-        use_ai = backlog <= AI_MAX_QUEUE_DEPTH
+        use_batch_ai = AI_ENABLE and backlog <= AI_MAX_QUEUE_DEPTH
+        need_diffs = use_batch_ai or bool(COMMIT_CMD)
 
         all_event_ops: List[Tuple[sqlite3.Row, List[Dict[str, Any]]]] = []
         diff_oids: List[str] = []
         for event in events:
             ops = ops_as_dicts(fetch_ops(conn, event["seq"]))
             all_event_ops.append((event, ops))
-            if use_ai:
+            if need_diffs:
                 for op in ops:
                     for key in ("before_oid", "after_oid"):
                         oid = op.get(key)
                         if oid:
                             diff_oids.append(oid)
 
-        blobs: Dict[str, bytes] = batch_cat_file(repo_root, diff_oids) if use_ai else {}
+        blobs: Dict[str, bytes] = (
+            batch_cat_file(repo_root, diff_oids) if need_diffs else {}
+        )
 
         # Precompute diffs once per event so the batch AI call and the
         # per-event commit loop can share the same text.
         diffs_by_event: Dict[int, Dict[int, str]] = {}
-        if use_ai:
+        if need_diffs:
             for event, ops in all_event_ops:
                 diffs_by_event[int(event["seq"])] = {
                     idx: op_diff_text(op, blobs) for idx, op in enumerate(ops)
@@ -1241,7 +1255,7 @@ def replay_batch(
         # the DB. On any per-chunk failure, the affected events simply
         # remain NULL and will fall back to deterministic at commit time.
         stored_messages: Dict[int, str] = {}
-        if use_ai:
+        if use_batch_ai:
             needs_message = [
                 (event, ops)
                 for event, ops in all_event_ops
@@ -1298,13 +1312,20 @@ def replay_batch(
             try:
                 apply_ops_to_index(repo_root, env, ops)
                 tree = run_git(repo_root, "write-tree", env=env).strip()
-                diffs = diffs_by_event.get(int(event["seq"]), {}) if use_ai else {}
+                diffs = diffs_by_event.get(int(event["seq"]), {}) if need_diffs else {}
                 stored = stored_messages.get(int(event["seq"]))
                 message = build_message(
-                    event, ops, diffs, use_ai=use_ai, stored_message=stored,
+                    event,
+                    ops,
+                    diffs,
+                    stored_message=stored,
                 )
                 commit_oid = run_git(
-                    repo_root, "commit-tree", tree, "-p", parent,
+                    repo_root,
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    parent,
                     input_bytes=message.encode("utf-8"),
                     env=env,
                 ).strip()
@@ -1530,23 +1551,35 @@ def cmd_status(git_dir: Path) -> int:
             state: conn.execute(
                 "SELECT COUNT(*) AS n FROM events WHERE state=?", (state,)
             ).fetchone()["n"]
-            for state in ("pending", "publishing", "published",
-                          "blocked_conflict", "failed")
+            for state in (
+                "pending",
+                "publishing",
+                "published",
+                "blocked_conflict",
+                "failed",
+            )
         }
         worker_row = conn.execute(
             "SELECT pid, heartbeat_ts, last_enqueue_ts FROM worker_state WHERE id=1"
         ).fetchone()
         tails = conn.execute("SELECT COUNT(*) AS n FROM path_tail").fetchone()["n"]
-        print(json.dumps({
-            "db": str(git_dir / DB_SUBPATH),
-            "counts": counts,
-            "path_tails": tails,
-            "worker": {
-                "pid": worker_row["pid"] if worker_row else 0,
-                "heartbeat_ts": worker_row["heartbeat_ts"] if worker_row else 0,
-                "last_enqueue_ts": worker_row["last_enqueue_ts"] if worker_row else 0,
-            },
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "db": str(git_dir / DB_SUBPATH),
+                    "counts": counts,
+                    "path_tails": tails,
+                    "worker": {
+                        "pid": worker_row["pid"] if worker_row else 0,
+                        "heartbeat_ts": worker_row["heartbeat_ts"] if worker_row else 0,
+                        "last_enqueue_ts": worker_row["last_enqueue_ts"]
+                        if worker_row
+                        else 0,
+                    },
+                },
+                indent=2,
+            )
+        )
         return 0
     finally:
         conn.close()
@@ -1598,15 +1631,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Snapshot autocommit worker")
     parser.add_argument("--repo", required=False, help="repo path (working directory)")
     parser.add_argument("--git-dir", required=False, help="explicit git dir override")
-    parser.add_argument("--status", action="store_true", help="print queue status and exit")
-    parser.add_argument("--flush", action="store_true", help="drain queue immediately and exit")
+    parser.add_argument(
+        "--status", action="store_true", help="print queue status and exit"
+    )
+    parser.add_argument(
+        "--flush", action="store_true", help="drain queue immediately and exit"
+    )
     args = parser.parse_args(argv)
 
     repo_input = Path(args.repo).expanduser() if args.repo else Path(os.getcwd())
     try:
         repo_root = Path(run_git(repo_input, "rev-parse", "--show-toplevel")).resolve()
         git_dir = (
-            Path(args.git_dir).expanduser().resolve() if args.git_dir
+            Path(args.git_dir).expanduser().resolve()
+            if args.git_dir
             else resolve_git_dir(repo_input, None)
         )
     except RuntimeError as exc:
