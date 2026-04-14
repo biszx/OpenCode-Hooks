@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""
-Universal snapshot autocommit hook.
+"""Capture file edits and queue them for replay.
 
-Reads any harness-specific PostToolUse / file-change JSON on stdin, normalizes
-it, captures an immutable git blob snapshot for each changed file, inserts one
-event row into a SQLite database living inside this worktree's private git
-dir, then wakes (or spawns) the singleton worker.
+This hook reads PostToolUse or file-change JSON from stdin, normalizes it into
+file operations, snapshots the current file contents into git blobs, and writes
+one queued event into the worktree-local SQLite database.
 
-All path_tail reads and writes happen inside one BEGIN IMMEDIATE transaction,
-so concurrent hooks for the same path cannot capture the same `before` state.
+It does the cheap part only. The actual replay and commit creation happen in
+``snapshot-worker.py`` after edits settle down.
+
+Concurrency matters here. All ``path_tail`` reads and writes happen inside one
+``BEGIN IMMEDIATE`` transaction, so two hooks racing on the same path cannot
+capture the same ``before`` state.
 """
 
 from __future__ import annotations
@@ -250,7 +252,9 @@ def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, 
             op = item.get("operation")
             if op == "rename":
                 add("rename", item.get("toPath"), item.get("fromPath"))
-            elif op in {"create", "modify", "delete"} and isinstance(item.get("path"), str):
+            elif op in {"create", "modify", "delete"} and isinstance(
+                item.get("path"), str
+            ):
                 add(op, item["path"])
         for f in payload.get("files") or []:
             if isinstance(f, str):
@@ -314,7 +318,10 @@ def hash_object(repo_root: Path, abs_path: Path) -> Tuple[Optional[str], Optiona
             return None, None
         try:
             oid = run_git(
-                repo_root, "hash-object", "-w", "--stdin",
+                repo_root,
+                "hash-object",
+                "-w",
+                "--stdin",
                 input_bytes=target.encode("utf-8", errors="replace"),
             )
         except RuntimeError as exc:
@@ -329,7 +336,9 @@ def hash_object(repo_root: Path, abs_path: Path) -> Tuple[Optional[str], Optiona
     return oid, mode
 
 
-def batch_ls_tree(repo_root: Path, rev: str, paths: List[str]) -> Dict[str, Tuple[str, str]]:
+def batch_ls_tree(
+    repo_root: Path, rev: str, paths: List[str]
+) -> Dict[str, Tuple[str, str]]:
     """One `git ls-tree -z` call for many paths. Returns {path: (oid, mode)}."""
     if not paths:
         return {}
@@ -386,7 +395,14 @@ def wake_or_spawn_worker(
         worker_path = str(Path(__file__).resolve().with_name("snapshot-worker.py"))
     try:
         subprocess.Popen(
-            [sys.executable, worker_path, "--repo", str(repo_root), "--git-dir", str(git_dir)],
+            [
+                sys.executable,
+                worker_path,
+                "--repo",
+                str(repo_root),
+                "--git-dir",
+                str(git_dir),
+            ],
             cwd=str(repo_root),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -444,39 +460,51 @@ def _build_op(
         after = hashes.get(path)
         if after is None:
             return None
-        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, path, head_entries)
+        before_oid, before_mode, tail_seq = _resolve_before(
+            conn, branch, path, head_entries
+        )
         if tail_seq is not None:
             observed.append(tail_seq)
         effective = "create" if before_oid is None else "modify"
-        return ({
-            "op": effective,
-            "path": path,
-            "before_oid": before_oid,
-            "before_mode": before_mode,
-            "after_oid": after[0],
-            "after_mode": after[1],
-        }, observed)
+        return (
+            {
+                "op": effective,
+                "path": path,
+                "before_oid": before_oid,
+                "before_mode": before_mode,
+                "after_oid": after[0],
+                "after_mode": after[1],
+            },
+            observed,
+        )
 
     if kind == "delete":
-        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, path, head_entries)
+        before_oid, before_mode, tail_seq = _resolve_before(
+            conn, branch, path, head_entries
+        )
         if tail_seq is not None:
             observed.append(tail_seq)
         if before_oid is None:
             return None
-        return ({
-            "op": "delete",
-            "path": path,
-            "before_oid": before_oid,
-            "before_mode": before_mode,
-            "after_oid": None,
-            "after_mode": None,
-        }, observed)
+        return (
+            {
+                "op": "delete",
+                "path": path,
+                "before_oid": before_oid,
+                "before_mode": before_mode,
+                "after_oid": None,
+                "after_mode": None,
+            },
+            observed,
+        )
 
     if kind == "rename":
         old_path = change.get("old_path")
         if not old_path:
             return None
-        before_oid, before_mode, tail_seq = _resolve_before(conn, branch, old_path, head_entries)
+        before_oid, before_mode, tail_seq = _resolve_before(
+            conn, branch, old_path, head_entries
+        )
         if tail_seq is not None:
             observed.append(tail_seq)
         if before_oid is None:
@@ -488,15 +516,18 @@ def _build_op(
         _tgt_oid, _tgt_mode, tgt_seq = _resolve_before(conn, branch, path, head_entries)
         if tgt_seq is not None:
             observed.append(tgt_seq)
-        return ({
-            "op": "rename",
-            "path": path,
-            "old_path": old_path,
-            "before_oid": before_oid,
-            "before_mode": before_mode,
-            "after_oid": after[0],
-            "after_mode": after[1],
-        }, observed)
+        return (
+            {
+                "op": "rename",
+                "path": path,
+                "old_path": old_path,
+                "before_oid": before_oid,
+                "before_mode": before_mode,
+                "after_oid": after[0],
+                "after_mode": after[1],
+            },
+            observed,
+        )
 
     debug(f"unsupported op: {kind}")
     return None
@@ -525,9 +556,15 @@ def insert_event_and_tails(
                                       before_oid, before_mode, after_oid, after_mode)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                seq, ord_idx, op["op"], op["path"], op.get("old_path"),
-                op.get("before_oid"), op.get("before_mode"),
-                op.get("after_oid"), op.get("after_mode"),
+                seq,
+                ord_idx,
+                op["op"],
+                op["path"],
+                op.get("old_path"),
+                op.get("before_oid"),
+                op.get("before_mode"),
+                op.get("after_oid"),
+                op.get("after_mode"),
             ),
         )
         conn.execute(
