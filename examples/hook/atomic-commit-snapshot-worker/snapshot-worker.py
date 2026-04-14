@@ -453,6 +453,16 @@ def open_db(git_dir: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS reconcile_pending (
+               branch_ref  TEXT NOT NULL,
+               path        TEXT NOT NULL,
+               pre_mode    TEXT,
+               pre_oid     TEXT,
+               created_ts  REAL NOT NULL,
+               PRIMARY KEY (branch_ref, path)
+           )"""
+    )
     existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "target_commit_oid" not in existing:
         try:
