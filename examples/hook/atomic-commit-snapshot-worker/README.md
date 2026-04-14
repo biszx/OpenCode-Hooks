@@ -8,18 +8,27 @@ If you want the short version:
 
 - `snapshot-hook.py` captures file changes and queues them.
 - `snapshot-worker.py` drains the queue and publishes commits.
+- `snapshot_shared.py` coordinates branch generation and same-branch ownership
+  through repo-common-dir shared state.
 - Each worktree gets its own isolated state under its private git dir.
+- Target contract: exact capture is guaranteed only for supported hook surfaces
+  and supported worktree or branch topologies.
+- Target contract: incomplete payload surfaces are best-effort. Unsupported
+  branch or worktree topologies should be rejected early or quarantined later,
+  not replayed in a degraded mode.
 - Built-in AI commit messages are optional. If AI is off or skipped, the worker
-  falls back to deterministic messages.
+  uses `SNAPSHOTD_COMMIT_MESSAGE_CMD` if configured, otherwise deterministic
+  commit messages.
 
 ## What it does
 
-There are two files:
+There are three files:
 
 - `snapshot-hook.py`
   - Reads hook payload JSON from stdin
   - Figures out which files changed
   - Hashes current file contents into git blobs
+  - Consults shared branch state before enqueue
   - Writes an event plus `path_tail` updates in one `BEGIN IMMEDIATE`
     transaction
   - Wakes the live worker with `SIGUSR1`, or spawns one if needed
@@ -31,8 +40,17 @@ There are two files:
   - Publishes with `git update-ref` compare-and-swap
   - Uses a two-phase publish so crashes can be recovered on restart
 
+- `snapshot_shared.py`
+  - Resolves the repo root, worktree git dir, and repo-common-dir
+  - Maintains shared per-branch registry state in the repo common dir
+  - Rejects unsupported same-branch multi-worktree ownership
+  - Tracks branch generation so rewritten or recreated branches can quarantine
+    stale local queue state
+
 Why split it this way? The hook stays cheap and fast. It just captures state.
-The worker does the expensive part later, once edits settle down.
+The worker does the expensive part later, once edits settle down. The shared
+helper exists because the queue is still worktree-local, but branch ownership
+and generation now need one repo-scoped source of truth.
 
 ## Where state lives
 
@@ -66,25 +84,178 @@ The hook and worker create these paths automatically:
 | `<git-dir>/ai-snapshotd/worker.index` | Temporary git index for replay |
 | `<git-dir>/ai-snapshotd/logs/hook.log` | Rotated hook debug log |
 | `<git-dir>/ai-snapshotd/logs/worker.log` | Rotated worker debug log |
+| `<git-dir>/ai-snapshotd.incompatible-<stamp>-<pid>/` | Quarantined local state from an incompatible older schema |
+| `<git-common-dir>/ai-snapshotd/branch-registry/*.json` | Shared branch owner + generation registry |
+| `<git-common-dir>/ai-snapshotd/branch-registry/*.lock` | Per-branch coordination locks |
 
 This isolation matters. Five projects with three worktrees each means fifteen
 independent queues and fifteen independent workers, not one shared bottleneck.
+It also means branch ownership is **not** repo-global today. A worktree-local
+queue can be exact for its own supported edit surfaces, but it must not pretend
+to coordinate the same branch across multiple worktrees unless future work adds
+explicit shared branch coordination.
+
+### Local versus shared state
+
+The implementation is now intentionally hybrid:
+
+- **Worktree-local state** stays in `snapshotd.db`
+  - `events`
+  - `event_ops`
+  - `path_tail`
+  - `reconcile_pending`
+  - `worker_state`
+- **Repo-shared state** lives under `branch-registry/`
+  - current branch owner worktree
+  - branch head observed by the snapshot system
+  - branch generation / incarnation tracking
+
+That means the system still replays from one local queue per worktree, but it no
+longer treats `branch_ref` alone as enough identity for safe replay.
+
+If the hook or worker finds an incompatible older local schema, it now
+quarantines that worktree-local `ai-snapshotd/` directory once and recreates a
+fresh current-state DB automatically. Shared `branch-registry/` state is left
+alone.
+
+## How it works now
+
+### 1. Capture path
+
+1. `snapshot-hook.py` resolves the repo root, worktree git dir, and repo common
+   dir.
+2. It asks `snapshot_shared.py` for the current branch registry entry.
+3. If the same branch is actively owned elsewhere, capture is rejected instead
+   of silently enqueueing unsafe work.
+4. The hook stores the event in the local queue with both:
+   - `branch_ref`
+   - `branch_generation`
+5. Local shadow state such as `path_tail` is also keyed by branch generation, so
+   old shadow state cannot be reused after a rewrite unnoticed.
+
+### 2. Replay path
+
+1. `snapshot-worker.py` reads only the local worktree queue.
+2. Before replay, it refreshes shared branch registry state.
+3. It replays only rows whose `branch_generation` still matches the shared
+   generation and whose `base_head` ancestry is still valid.
+4. If the branch was rewritten or the topology is unsupported, the worker
+   settles those rows as `blocked_conflict` instead of replaying them.
+
+### 3. Why this is three files now
+
+Before, the example could treat the worktree-local SQLite DB as the whole state
+model. After adding branch generation and same-branch ownership guards, that was
+no longer enough.
+
+So the responsibilities are now split like this:
+
+- `snapshot-hook.py`: capture and local enqueue
+- `snapshot-worker.py`: replay, publish, and reconcile
+- `snapshot_shared.py`: repo-shared branch identity and ownership checks
+
+That third file is not a second queue. It is the minimal shared coordination
+layer needed to keep the existing local queue model safe.
 
 ## Event states
+
+Current code already uses these states today. The broader topology and
+branch-generation quarantine meanings below describe the target semantics that
+future implementation is intended to add.
 
 | State | Meaning |
 |------|---------|
 | `pending` | Captured and waiting to replay |
 | `publishing` | Commit objects are built and `update-ref` is next |
 | `published` | The branch now includes the event |
-| `blocked_conflict` | Replay could not apply cleanly against current state |
+| `blocked_conflict` | Replay was rejected because the state no longer matches. In the target contract, this is also the settled quarantine state for unsupported topology or stale branch generations. |
 | `failed` | Hard error during replay or commit creation |
 
 `publishing` is intentionally transient. If the worker crashes between
 `update-ref` and DB settlement, startup recovery checks whether the target
 commit made it into history and fixes the state from there.
 
-## Concurrency guarantees
+## Capture contract
+
+The system has to be explicit about when a queued event is exact, when it is
+best-effort, and when it must be quarantined instead of replayed.
+
+This section defines the target contract for the concurrency-hardening work in
+this example. The current code already has per-worktree queues and serialized
+same-path capture, but future implementation still needs to enforce the explicit
+branch-generation and same-branch multi-worktree guards described below.
+
+Best-effort applies only to incomplete source payloads. Unsupported branch or
+worktree topology is **not** best-effort; it is a quarantine case.
+
+Canonical handling rule:
+
+- If unsupported topology is detected **before enqueue**, the hook should reject
+  the capture and record the failure visibly.
+- If unsupported topology or a stale generation is discovered **after enqueue**,
+  the worker should quarantine the row by settling it as `blocked_conflict` with
+  an explicit reason.
+
+### Exact versus best-effort sources
+
+| Source | Capture fidelity | Notes |
+|------|------------------|-------|
+| OpenCode `file.changed` payloads with explicit `changes[]` | Exact for the structured entries the payload reports | This is the preferred OpenCode surface. With the `opencode-hooks` plugin, `file.changed` fires for supported mutation tools such as `write`, `edit`, `multiedit`, `patch`, and `apply_patch`. The payload names the changed paths directly, so the hook can snapshot those paths without guessing. If the payload also adds extra `files[]` entries, those extras are additive best-effort hints rather than part of the exact structured operation set. |
+| OpenCode `file.changed` payloads with `files[]` only and no structured `changes[]` | Best-effort | The event identifies candidate paths, but it does not preserve the exact operation set. |
+| Claude/OpenCode edit-style tool payloads (for example `Write`, `Edit`, `MultiEdit`, `NotebookEdit`) | Exact for the explicit target paths in the payload | Exactness is only for the paths the tool reports, and only if the hook is wired to receive those tool events. Claude Code documents `Write` and `Edit`; do not assume undocumented tool names. |
+| Generic payloads that expose only one path field (`file_path`, `path`, `files`, etc.) | Best-effort | The hook snapshots current contents of the discovered paths, but it cannot prove those paths are the complete edit set. |
+| Harnesses that do not report per-edit changed files reliably, such as shell-driven edit flows | Best-effort | The queue may coalesce or miss intermediate file states because the hook is inferring paths after the fact. |
+
+If a source is best-effort, the system should say that plainly. It should not
+claim exact per-edit replay semantics for that event.
+
+### Supported worktree and branch matrix
+
+| Topology | Status | Why |
+|---------|--------|-----|
+| One worktree editing one checked-out branch | Supported for exact capture when the source is exact | The queue, worker, index, and branch checkout all belong to the same worktree. |
+| Multiple worktrees in the same repo on different branches | Supported, with one independent queue per worktree | Branch refs differ, so the worktrees do not need cross-worktree branch coordination. |
+| Multiple worktrees in the same repo on the **same** branch | Unsupported for autocommit replay | Branch refs are shared across worktrees but queue state is not. The hook should reject before enqueue when it can detect this early; otherwise the worker must quarantine instead of guessing. |
+| Unborn branch / empty repo with no `HEAD` commit yet | Unsupported | The hook cannot record a stable `base_head` generation anchor before the first commit exists. |
+| Detached HEAD | Unsupported | The hook skips capture because there is no symbolic branch ref to own the event stream. |
+
+### Branch generation and quarantine semantics
+
+- `events.base_head` is the capture-time ancestry anchor.
+- The current implementation also uses a shared branch-incarnation signal in
+  repo-common-dir state so branch delete-and-recreate can be distinguished from
+  an ordinary fast-forward on the same branch name.
+- A queued event is safe to replay only while the live branch still belongs to
+  the same branch generation as that ancestry anchor plus incarnation signal.
+- Fast-forward commits after capture are allowed. They stay in the same
+  generation.
+- If the branch is reset, rebased, force-moved, deleted, or recreated so the
+  live tip is no longer a descendant of `base_head`, the queued event is stale.
+- Deleting and recreating a branch starts a new generation even if the recreated
+  ref later points to the same commit or a descendant. A new ref incarnation
+  must not inherit the old pending queue implicitly.
+- Stale or unsupported events must be quarantined by settling them as
+  `blocked_conflict` with an explicit generation or topology reason. They must
+  not be silently retried against the new branch incarnation.
+
+This is the contract the current implementation is working toward enforcing:
+exact
+capture only in supported modes, explicit best-effort labeling for inferred
+paths, and quarantine instead of opportunistic replay when branch identity is
+no longer trustworthy.
+
+### Mixed-fidelity events
+
+One payload can mix exact structured operations and best-effort hints. For
+example, an OpenCode `file.changed` event may provide exact `changes[]` entries
+plus extra `files[]` entries that are only hints.
+
+Downstream schema work therefore needs fidelity metadata that can represent
+mixed events. The required contract is per-op fidelity (or an equivalent encoding
+that preserves which captured paths were exact vs best-effort). Event-level-only
+fidelity is not sufficient.
+
+## Current guarantees and guardrails
 
 - **Same-path hooks are serialized**
   - `path_tail` reads and writes happen inside one `BEGIN IMMEDIATE`
@@ -96,21 +267,26 @@ commit made it into history and fixes the state from there.
   - If another worker starts, it exits.
   - The hook prefers signalling a live worker over spawning a new one.
 
-- **Worktrees stay isolated**
+- **Worktrees stay isolated, but branch ownership does not**
   - Different git dirs mean different DBs, locks, logs, and workers.
-  - No cross-worktree contention.
+  - That isolation is safe for different branches.
+  - It is **not** enough to make same-branch multi-worktree replay exact.
+    Exact mode therefore assumes one worktree owns a branch at a time.
 
 - **Branch-specific replay**
-  - The worker only processes pending events for the currently checked out
-    branch.
+  - Today, the worker only processes pending events for the currently checked
+    out branch.
   - Events for other branches stay pending until that branch is active again.
-  - If a branch is gone, pending events for it become `blocked_conflict`.
+  - That branch-name check is necessary but not sufficient. The current
+    implementation also enforces shared branch generation checks and rejects or
+    quarantines unsupported same-branch multi-worktree cases.
 
 - **Crash recovery is explicit**
-  - Leftover `publishing` rows are reconciled on startup.
+  - Today, leftover `publishing` rows are reconciled on startup.
   - If the target commit is already an ancestor of the branch tip, the event is
     marked `published`.
-  - Otherwise it goes back to `pending`.
+  - If the branch generation or ancestry no longer matches, the row is
+    quarantined instead of being replayed into a new branch incarnation.
 
 ## Wiring
 
@@ -123,7 +299,7 @@ Add this to `~/.claude/settings.json` or `.claude/settings.json` in the repo:
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "matcher": "Write|Edit",
         "hooks": [
           {
             "type": "command",
@@ -136,6 +312,9 @@ Add this to `~/.claude/settings.json` or `.claude/settings.json` in the repo:
   }
 }
 ```
+
+Claude Code currently documents `Write` and `Edit` for file-edit hooks. If you
+expand the matcher, do it only for tool names your harness actually emits.
 
 ### OpenCode
 
@@ -155,6 +334,10 @@ Add this to `~/.config/opencode/opencode.json`:
   ]
 }
 ```
+
+With the `opencode-hooks` plugin, this `file.changed` hook is the intended
+trigger surface for supported mutation tools such as `write`, `edit`,
+`multiedit`, `patch`, and `apply_patch`.
 
 ### Codex
 
@@ -198,16 +381,18 @@ When AI is enabled and the backlog is at or below
 2. Split them into chunks of `SNAPSHOTD_AI_CHUNK_SIZE`
 3. Send one structured-output request per chunk
 4. Persist returned messages into `events.message`
-5. Build commits from stored messages, falling back to deterministic messages
-   for any event whose chunk failed
+5. Build commits from stored messages, falling back to
+   `SNAPSHOTD_COMMIT_MESSAGE_CMD` if configured, otherwise deterministic commit
+   messages, for any event whose chunk failed
 
 Why this design is better:
 
 - It cuts prompt overhead on bursts because one request covers many events.
 - It keeps replay predictable because generated messages are stored before the
   commit loop.
-- It degrades cleanly. One bad chunk falls back to deterministic messages for
-  that chunk only.
+- It degrades cleanly. One bad chunk falls back to
+  `SNAPSHOTD_COMMIT_MESSAGE_CMD` if configured, otherwise deterministic commit
+  messages, for that chunk only.
 
 Each request uses a JSON schema. The model has to return a `messages` array,
 keyed by event `seq`. Sensitive-path redaction still happens per event before
@@ -272,6 +457,10 @@ the base URL HTTPS-only, and do not try to be clever about redaction.
 - Unix only. The worker uses advisory `fcntl` locks.
 - Some harnesses do not report exact changed files for every tool. In those
   cases, capture is best-effort.
+- Exact autocommit does not support multiple worktrees sharing the same branch
+  unless later work adds explicit repo-global branch coordination.
+- Branch rewrites are not safe to auto-replay across generations. Stale pending
+  work must be quarantined instead.
 - `blocked_conflict` events are recorded, not auto-retried.
 - After a successful publish, the worker resets only the paths it just
   committed, and only when the live index still matches the pre-publish HEAD.
