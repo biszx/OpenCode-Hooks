@@ -11,6 +11,16 @@ It does the cheap part only. The actual replay and commit creation happen in
 Concurrency matters here. All ``path_tail`` reads and writes happen inside one
 ``BEGIN IMMEDIATE`` transaction, so two hooks racing on the same path cannot
 capture the same ``before`` state.
+
+Contract note: exact capture depends on the payload surface. Events are exact
+only when the hook is given an explicit edit surface for the changed paths and
+when one worktree owns the branch being captured. Incomplete payload surfaces
+can be best-effort. Unsupported same-branch multi-worktree topologies and stale
+branch generations are quarantine cases, not degraded replay modes. If the hook
+can detect unsupported topology before enqueue, it should reject the capture
+instead of creating a row that future implementation would have to quarantine.
+These topology and generation guards are part of the target contract and are
+spelled out here so future work can implement them consistently.
 """
 
 from __future__ import annotations
@@ -27,6 +37,14 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from snapshot_shared import (
+    IncompatibleLocalStateError,
+    LOCAL_STATE_SCHEMA_VERSION,
+    ensure_branch_registry,
+    quarantine_incompatible_local_state,
+    resolve_repo_paths,
+)
+
 
 STATE_SUBDIR = "ai-snapshotd"
 DB_SUBPATH = f"{STATE_SUBDIR}/snapshotd.db"
@@ -37,6 +55,24 @@ WORKER_HEARTBEAT_STALE = float(os.environ.get("SNAPSHOTD_HEARTBEAT_STALE", "15")
 DEBUG = os.environ.get("SNAPSHOTD_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
 
+# Event contract for downstream lanes (not fully enforced yet):
+# - branch_ref names the symbolic ref captured by the hook.
+# - base_head is the ancestry anchor for that event. Later lanes also need an
+#   explicit branch-incarnation signal so delete-and-recreate can be
+#   distinguished from a normal fast-forward on the same branch name.
+# - source/tool payload determines capture fidelity. Explicit file-change or
+#   edit payloads can be exact for the reported paths. Generic fallback path
+#   discovery is best_effort only. ``file.changed`` with only ``files[]`` and no
+#   structured ``changes[]`` is also best_effort. In OpenCode, ``file.changed``
+#   is the preferred surface for supported mutation tools such as ``write``,
+#   ``edit``, ``multiedit``, ``patch``, and ``apply_patch``.
+# - Mixed-fidelity payloads exist, so downstream schema work needs per-op (or
+#   equivalently expressive) fidelity metadata rather than one event-level flag.
+# - Per-worktree queues are isolated, but exact autocommit still assumes one
+#   worktree owns a branch at a time. Same-branch multi-worktree activity must
+#   be rejected or quarantined rather than replayed opportunistically.
+# - Branch deletion and recreation starts a new generation even when the branch
+#   name is reused.
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -46,6 +82,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS events (
   seq               INTEGER PRIMARY KEY AUTOINCREMENT,
   branch_ref        TEXT NOT NULL,
+  branch_generation INTEGER NOT NULL,
   base_head         TEXT NOT NULL,
   session_id        TEXT,
   tool_name         TEXT,
@@ -60,7 +97,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_state_seq ON events(state, seq);
-CREATE INDEX IF NOT EXISTS idx_events_branch     ON events(branch_ref, state, seq);
+CREATE INDEX IF NOT EXISTS idx_events_branch     ON events(branch_ref, branch_generation, state, seq);
 
 CREATE TABLE IF NOT EXISTS event_ops (
   event_seq   INTEGER NOT NULL,
@@ -80,11 +117,12 @@ CREATE INDEX IF NOT EXISTS idx_ops_path ON event_ops(path);
 
 CREATE TABLE IF NOT EXISTS path_tail (
   branch_ref  TEXT NOT NULL,
+  branch_generation INTEGER NOT NULL,
   path        TEXT NOT NULL,
   tail_oid    TEXT,
   tail_mode   TEXT,
   source_seq  INTEGER NOT NULL,
-  PRIMARY KEY (branch_ref, path)
+  PRIMARY KEY (branch_ref, branch_generation, path)
 );
 
 CREATE TABLE IF NOT EXISTS worker_state (
@@ -97,11 +135,12 @@ CREATE TABLE IF NOT EXISTS worker_state (
 
 CREATE TABLE IF NOT EXISTS reconcile_pending (
   branch_ref  TEXT NOT NULL,
+  branch_generation INTEGER NOT NULL,
   path        TEXT NOT NULL,
   pre_mode    TEXT,
   pre_oid     TEXT,
   created_ts  REAL NOT NULL,
-  PRIMARY KEY (branch_ref, path)
+  PRIMARY KEY (branch_ref, branch_generation, path)
 );
 
 INSERT OR IGNORE INTO worker_state(id, pid, heartbeat_ts, last_enqueue_ts, started_ts)
@@ -152,7 +191,16 @@ def debug(message: str) -> None:
 
 
 def migrate_schema(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version not in (0, LOCAL_STATE_SCHEMA_VERSION):
+        raise IncompatibleLocalStateError(
+            f"incompatible snapshot DB user_version={version}; expected {LOCAL_STATE_SCHEMA_VERSION}"
+        )
     existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "branch_generation" not in existing:
+        raise IncompatibleLocalStateError(
+            "legacy snapshot DB missing events.branch_generation"
+        )
     if "target_commit_oid" not in existing:
         try:
             conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
@@ -163,16 +211,60 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE events ADD COLUMN message TEXT")
         except sqlite3.OperationalError:
             pass
+    path_tail_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(path_tail)")
+    }
+    if "branch_generation" not in path_tail_existing:
+        raise IncompatibleLocalStateError(
+            "legacy snapshot DB missing path_tail.branch_generation"
+        )
+    reconcile_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(reconcile_pending)")
+    }
+    if "branch_generation" not in reconcile_existing:
+        raise IncompatibleLocalStateError(
+            "legacy snapshot DB missing reconcile_pending.branch_generation"
+        )
+    conn.execute(f"PRAGMA user_version={LOCAL_STATE_SCHEMA_VERSION}")
+
+
+def _open_db_once(git_dir: Path) -> sqlite3.Connection:
+    db_path = git_dir / DB_SUBPATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    existed = db_path.exists()
+    conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(SCHEMA_SQL)
+        except sqlite3.OperationalError as exc:
+            if existed:
+                raise IncompatibleLocalStateError(
+                    f"legacy snapshot DB bootstrap failed: {exc}"
+                ) from exc
+            raise
+        migrate_schema(conn)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def open_db(git_dir: Path) -> sqlite3.Connection:
-    db_path = git_dir / DB_SUBPATH
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA_SQL)
-    migrate_schema(conn)
-    return conn
+    last_exc: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            return _open_db_once(git_dir)
+        except IncompatibleLocalStateError as exc:
+            last_exc = exc
+            quarantined = quarantine_incompatible_local_state(git_dir, str(exc))
+            if quarantined is None:
+                debug("incompatible snapshot state disappeared before reset; retrying")
+            else:
+                debug(f"quarantined incompatible snapshot state at {quarantined}")
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("failed to open snapshot database")
 
 
 def run_git(cwd: Path, *args: str, input_bytes: Optional[bytes] = None) -> str:
@@ -218,8 +310,7 @@ def resolve_cwd(payload: Dict[str, Any]) -> Path:
 
 
 def resolve_repo(cwd: Path) -> Tuple[Path, Path]:
-    repo_root = Path(run_git(cwd, "rev-parse", "--show-toplevel"))
-    git_dir = Path(run_git(cwd, "rev-parse", "--absolute-git-dir"))
+    repo_root, git_dir, _common_dir = resolve_repo_paths(cwd)
     return repo_root, git_dir
 
 
@@ -235,6 +326,12 @@ def rel_path(repo_root: Path, candidate: str) -> Optional[str]:
 
 
 def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, Any]]:
+    """Extract changed paths from one hook payload.
+
+    Exactness depends on the payload surface. Explicit file-change/edit payloads
+    can be exact for the paths they enumerate. Generic fallback fields are only
+    best-effort path discovery and should not be documented as exact capture.
+    """
     ops: List[Dict[str, Any]] = []
     seen: set = set()
 
@@ -274,7 +371,7 @@ def extract_changes(payload: Dict[str, Any], repo_root: Path) -> List[Dict[str, 
     tool_input = payload.get("tool_input") or {}
     if tool_name and isinstance(tool_input, dict):
         lower = tool_name.lower()
-        if lower in {"write", "edit", "multiedit"}:
+        if lower in {"write", "edit", "multiedit", "patch", "apply_patch"}:
             fp = tool_input.get("file_path")
             if isinstance(fp, str):
                 add("modify", fp)
@@ -437,13 +534,14 @@ def detect_source(payload: Dict[str, Any]) -> str:
 def _resolve_before(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     path: str,
     head_entries: Dict[str, Tuple[str, str]],
 ) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """Return (before_oid, before_mode, tail_source_seq)."""
     row = conn.execute(
-        "SELECT tail_oid, tail_mode, source_seq FROM path_tail WHERE branch_ref=? AND path=?",
-        (branch, path),
+        "SELECT tail_oid, tail_mode, source_seq FROM path_tail WHERE branch_ref=? AND branch_generation=? AND path=?",
+        (branch, branch_generation, path),
     ).fetchone()
     if row is not None:
         return row["tail_oid"], row["tail_mode"], int(row["source_seq"])
@@ -456,24 +554,25 @@ def _resolve_before(
 def _build_op(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     change: Dict[str, Any],
     hashes: Dict[str, Tuple[str, str]],
     head_entries: Dict[str, Tuple[str, str]],
-) -> Optional[Tuple[Dict[str, Any], List[int]]]:
-    """Return (op_row, observed_tail_source_seqs) for CAS tracking."""
+) -> Optional[Tuple[Dict[str, Any], List[Tuple[str, int]]]]:
+    """Return (op_row, observed_tail_entries) for CAS tracking."""
     kind = change["op"]
     path = change["path"]
-    observed: List[int] = []
+    observed: List[Tuple[str, int]] = []
 
     if kind in {"create", "modify"}:
         after = hashes.get(path)
         if after is None:
             return None
         before_oid, before_mode, tail_seq = _resolve_before(
-            conn, branch, path, head_entries
+            conn, branch, branch_generation, path, head_entries
         )
         if tail_seq is not None:
-            observed.append(tail_seq)
+            observed.append((path, tail_seq))
         effective = "create" if before_oid is None else "modify"
         return (
             {
@@ -489,10 +588,10 @@ def _build_op(
 
     if kind == "delete":
         before_oid, before_mode, tail_seq = _resolve_before(
-            conn, branch, path, head_entries
+            conn, branch, branch_generation, path, head_entries
         )
         if tail_seq is not None:
-            observed.append(tail_seq)
+            observed.append((path, tail_seq))
         if before_oid is None:
             return None
         return (
@@ -512,19 +611,21 @@ def _build_op(
         if not old_path:
             return None
         before_oid, before_mode, tail_seq = _resolve_before(
-            conn, branch, old_path, head_entries
+            conn, branch, branch_generation, old_path, head_entries
         )
         if tail_seq is not None:
-            observed.append(tail_seq)
+            observed.append((old_path, tail_seq))
         if before_oid is None:
             return None
         after = hashes.get(path)
         if after is None:
             return None
         # Also track target-path tail, in case a prior event referenced it.
-        _tgt_oid, _tgt_mode, tgt_seq = _resolve_before(conn, branch, path, head_entries)
+        _tgt_oid, _tgt_mode, tgt_seq = _resolve_before(
+            conn, branch, branch_generation, path, head_entries
+        )
         if tgt_seq is not None:
-            observed.append(tgt_seq)
+            observed.append((path, tgt_seq))
         return (
             {
                 "op": "rename",
@@ -545,6 +646,7 @@ def _build_op(
 def insert_event_and_tails(
     conn: sqlite3.Connection,
     branch: str,
+    branch_generation: int,
     base_head: str,
     session_id: str,
     tool_name: str,
@@ -553,10 +655,10 @@ def insert_event_and_tails(
 ) -> int:
     now = time.time()
     cur = conn.execute(
-        """INSERT INTO events(branch_ref, base_head, session_id, tool_name, source,
+        """INSERT INTO events(branch_ref, branch_generation, base_head, session_id, tool_name, source,
                               captured_ts, state)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
-        (branch, base_head, session_id, tool_name, source, now),
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
+        (branch, branch_generation, base_head, session_id, tool_name, source, now),
     )
     seq = int(cur.lastrowid)
     for ord_idx, op in enumerate(ops):
@@ -577,21 +679,28 @@ def insert_event_and_tails(
             ),
         )
         conn.execute(
-            """INSERT INTO path_tail(branch_ref, path, tail_oid, tail_mode, source_seq)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(branch_ref, path) DO UPDATE SET
-                 tail_oid=excluded.tail_oid,
-                 tail_mode=excluded.tail_mode,
-                 source_seq=excluded.source_seq""",
-            (branch, op["path"], op.get("after_oid"), op.get("after_mode"), seq),
+            """INSERT INTO path_tail(branch_ref, branch_generation, path, tail_oid, tail_mode, source_seq)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
+                  tail_oid=excluded.tail_oid,
+                  tail_mode=excluded.tail_mode,
+                  source_seq=excluded.source_seq""",
+            (
+                branch,
+                branch_generation,
+                op["path"],
+                op.get("after_oid"),
+                op.get("after_mode"),
+                seq,
+            ),
         )
         if op["op"] == "rename" and op.get("old_path"):
             conn.execute(
-                """INSERT INTO path_tail(branch_ref, path, tail_oid, tail_mode, source_seq)
-                   VALUES (?, ?, NULL, NULL, ?)
-                   ON CONFLICT(branch_ref, path) DO UPDATE SET
-                     tail_oid=NULL, tail_mode=NULL, source_seq=excluded.source_seq""",
-                (branch, op["old_path"], seq),
+                """INSERT INTO path_tail(branch_ref, branch_generation, path, tail_oid, tail_mode, source_seq)
+                   VALUES (?, ?, ?, NULL, NULL, ?)
+                   ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
+                      tail_oid=NULL, tail_mode=NULL, source_seq=excluded.source_seq""",
+                (branch, branch_generation, op["old_path"], seq),
             )
     conn.execute(
         "UPDATE worker_state SET last_enqueue_ts=? WHERE id=1",
@@ -604,7 +713,7 @@ def handle_payload(payload: Dict[str, Any]) -> int:
     global _LOG_PATH
     cwd = resolve_cwd(payload)
     try:
-        repo_root, git_dir = resolve_repo(cwd)
+        repo_root, git_dir, common_dir = resolve_repo_paths(cwd)
     except RuntimeError as exc:
         debug(f"not a git repo: {cwd}: {exc}")
         return 0
@@ -616,11 +725,6 @@ def handle_payload(payload: Dict[str, Any]) -> int:
         branch = ""
     if not branch:
         debug("detached HEAD, skipping")
-        return 0
-    try:
-        base_head = run_git(repo_root, "rev-parse", "HEAD").strip()
-    except RuntimeError as exc:
-        debug(f"rev-parse HEAD failed: {exc}")
         return 0
 
     changes = extract_changes(payload, repo_root)
@@ -660,8 +764,6 @@ def handle_payload(payload: Dict[str, Any]) -> int:
             if isinstance(value, str) and value not in seen_paths:
                 seen_paths.add(value)
                 head_paths.append(value)
-    head_entries = batch_ls_tree(repo_root, base_head, head_paths)
-
     conn = open_db(git_dir)
     try:
         session_id = str(payload.get("session_id") or "")
@@ -671,12 +773,30 @@ def handle_payload(payload: Dict[str, Any]) -> int:
         # CAS loop: re-read path_tail under BEGIN IMMEDIATE; if a concurrent
         # hook bumped source_seq for any observed tail, retry from scratch.
         for attempt in range(6):
+            try:
+                observed_head = run_git(repo_root, "rev-parse", "HEAD").strip()
+                branch_state = ensure_branch_registry(
+                    repo_root, git_dir, common_dir, branch, observed_head
+                )
+                branch_generation = int(branch_state["generation"])
+            except RuntimeError as exc:
+                debug(f"branch registry failed: {exc}")
+                return 0
             conn.execute("BEGIN IMMEDIATE")
             try:
+                current_head = run_git(repo_root, "rev-parse", "HEAD").strip()
+                if current_head != observed_head:
+                    conn.execute("ROLLBACK")
+                    debug(f"branch moved during capture setup, retry {attempt + 1}")
+                    time.sleep(0.005 * (attempt + 1))
+                    continue
+                head_entries = batch_ls_tree(repo_root, current_head, head_paths)
                 ops: List[Dict[str, Any]] = []
-                observed: List[int] = []
+                observed: List[Tuple[str, int]] = []
                 for change in survivors:
-                    built = _build_op(conn, branch, change, hashes, head_entries)
+                    built = _build_op(
+                        conn, branch, branch_generation, change, hashes, head_entries
+                    )
                     if built is None:
                         continue
                     ops.append(built[0])
@@ -687,10 +807,11 @@ def handle_payload(payload: Dict[str, Any]) -> int:
 
                 # Verify observed source_seqs are still current before we commit.
                 stale = False
-                for seq in observed:
+                for observed_path, seq in observed:
                     check = conn.execute(
-                        "SELECT 1 FROM path_tail WHERE source_seq=?",
-                        (seq,),
+                        """SELECT 1 FROM path_tail
+                           WHERE branch_ref=? AND branch_generation=? AND path=? AND source_seq=?""",
+                        (branch, branch_generation, observed_path, seq),
                     ).fetchone()
                     if check is None:
                         stale = True
@@ -702,7 +823,14 @@ def handle_payload(payload: Dict[str, Any]) -> int:
                     continue
 
                 new_seq = insert_event_and_tails(
-                    conn, branch, base_head, session_id, tool_name, source, ops
+                    conn,
+                    branch,
+                    branch_generation,
+                    current_head,
+                    session_id,
+                    tool_name,
+                    source,
+                    ops,
                 )
                 conn.execute("COMMIT")
                 debug(f"queued event seq={new_seq} ops={len(ops)} branch={branch}")
