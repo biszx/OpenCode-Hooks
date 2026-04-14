@@ -509,6 +509,48 @@ def latest_enqueue(conn: sqlite3.Connection) -> float:
     return float(row["last_enqueue_ts"] or 0.0) if row else 0.0
 
 
+def queue_reconcile_paths(
+    conn: sqlite3.Connection,
+    branch: str,
+    pre_publish_head_entries: Dict[str, Tuple[str, str]],
+    paths: List[str],
+) -> None:
+    now = time.time()
+    for path in sorted(set(paths)):
+        pre = pre_publish_head_entries.get(path)
+        conn.execute(
+            """INSERT INTO reconcile_pending(branch_ref, path, pre_mode, pre_oid, created_ts)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(branch_ref, path) DO UPDATE SET
+                 pre_mode=excluded.pre_mode,
+                 pre_oid=excluded.pre_oid,
+                 created_ts=excluded.created_ts""",
+            (branch, path, pre[0] if pre else None, pre[1] if pre else None, now),
+        )
+
+
+def fetch_reconcile_pending(conn: sqlite3.Connection, branch: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        """SELECT branch_ref, path, pre_mode, pre_oid, created_ts
+           FROM reconcile_pending
+           WHERE branch_ref=?
+           ORDER BY created_ts, path""",
+        (branch,),
+    ).fetchall()
+
+
+def clear_reconcile_paths(
+    conn: sqlite3.Connection, branch: str, paths: Iterable[str]
+) -> None:
+    unique = sorted(set(paths))
+    if not unique:
+        return
+    conn.executemany(
+        "DELETE FROM reconcile_pending WHERE branch_ref=? AND path=?",
+        [(branch, path) for path in unique],
+    )
+
+
 def update_heartbeat(conn: sqlite3.Connection, pid: int) -> None:
     conn.execute(
         "UPDATE worker_state SET pid=?, heartbeat_ts=? WHERE id=1",
