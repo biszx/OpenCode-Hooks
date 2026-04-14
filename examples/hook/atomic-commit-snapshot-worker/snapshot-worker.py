@@ -58,6 +58,10 @@ AI_CHUNK_SIZE = max(1, min(100, int(os.environ.get("SNAPSHOTD_AI_CHUNK_SIZE", "2
 RETENTION_SECONDS = float(os.environ.get("SNAPSHOTD_RETENTION_SECONDS", str(7 * 86400)))
 LOG_MAX_BYTES = int(os.environ.get("SNAPSHOTD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 LOG_KEEP = int(os.environ.get("SNAPSHOTD_LOG_KEEP", "3"))
+RECONCILE_RETRY_ATTEMPTS = max(
+    1, int(os.environ.get("SNAPSHOTD_RECONCILE_RETRY_ATTEMPTS", "3"))
+)
+RECONCILE_RETRY_SLEEP = float(os.environ.get("SNAPSHOTD_RECONCILE_RETRY_SLEEP", "0.2"))
 
 DEBUG = os.environ.get("SNAPSHOTD_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
