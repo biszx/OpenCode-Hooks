@@ -665,21 +665,64 @@ def op_diff_text(op: Dict[str, Any], blobs: Dict[str, bytes]) -> str:
     return "\n".join(diff)[:4000]
 
 
+def _basename(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    return name or path
+
+
+def _trim_subject(subject: str, limit: int = 50) -> str:
+    """Trim a commit subject to `limit` characters, preferring a word
+    boundary and adding an ellipsis. Never cuts mid-token."""
+    subject = subject.strip()
+    if len(subject) <= limit:
+        return subject
+    head = subject[: limit - 1]
+    boundary = max(head.rfind(" "), head.rfind("/"), head.rfind("."))
+    if boundary >= limit // 2:
+        return head[:boundary].rstrip(" /.") + "…"
+    return head.rstrip() + "…"
+
+
+def _common_dir(paths: List[str]) -> str:
+    if not paths:
+        return ""
+    parts = [p.split("/") for p in paths]
+    common: List[str] = []
+    for segments in zip(*parts):
+        first = segments[0]
+        if all(s == first for s in segments):
+            common.append(first)
+        else:
+            break
+    # Drop the filename component so we get a directory prefix only.
+    if common and common == parts[0][: len(common)] and len(common) == len(parts[0]):
+        common = common[:-1]
+    return "/".join(common)
+
+
 def deterministic_message(event: sqlite3.Row, ops: List[Dict[str, Any]]) -> str:
     if len(ops) == 1:
         op = ops[0]
         kind = op["op"]
+        name = _basename(op["path"])
         if kind == "create":
-            subject = f"Add {op['path']}"
+            subject = f"Add {name}"
         elif kind == "modify":
-            subject = f"Update {op['path']}"
+            subject = f"Update {name}"
         elif kind == "delete":
-            subject = f"Remove {op['path']}"
+            subject = f"Remove {name}"
         else:
-            subject = f"Rename {op.get('old_path')} to {op['path']}"
+            subject = f"Rename {_basename(op.get('old_path'))} to {name}"
     else:
-        subject = f"Update {len(ops)} files"
-    subject = subject[:50].rstrip()
+        paths = [op["path"] for op in ops]
+        shared = _common_dir(paths)
+        if shared:
+            subject = f"Update {len(ops)} files in {shared}"
+        else:
+            subject = f"Update {len(ops)} files"
+    subject = _trim_subject(subject)
     lines = [subject, ""]
     for op in ops[:10]:
         if op["op"] == "rename":
@@ -697,7 +740,7 @@ def sanitize_message(text: str) -> str:
     if not lines:
         return "Update files"
     subject = re.sub(r"^[\-*\s]+", "", lines[0]).strip().rstrip(".")
-    subject = subject[:50].rstrip() or "Update files"
+    subject = _trim_subject(subject) if subject else "Update files"
     body: List[str] = []
     current: Optional[str] = None
     for line in lines[1:]:
