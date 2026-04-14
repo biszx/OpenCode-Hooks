@@ -2,36 +2,25 @@
 """
 Singleton snapshot worker.
 
-Runs per worktree/git-dir. Processes pending events from the SQLite journal,
-replays them onto the current branch tip, publishes with compare-and-swap via
+Runs per worktree / git-dir. Drains the SQLite journal, replays pending events
+onto the current branch tip, publishes with compare-and-swap via
 `git update-ref`, and exits after an idle window.
 
-Lifecycle:
-- Spawned by snapshot-hook.py after each captured event.
-- Acquires an exclusive flock on <git-dir>/ai-snapshotd/worker.lock.
-  If it cannot acquire within a brief retry window, another worker is already
-  running and this process exits cleanly.
-- Loops:
-    * update heartbeat
-    * wait for quiet window (no enqueue for QUIET_SECONDS)
-    * read pending events for the current branch
-    * replay onto current HEAD using a temp index + commit-tree
-    * CAS publish with update-ref <branch> <new> <old>
-    * mark events published or blocked_conflict
-- Exits when: no pending events AND last_enqueue_ts is older than IDLE_SECONDS.
+Crash safety
+------------
+Publishing is two-phase. Before calling `update-ref`, all events in the batch
+are marked `publishing` with their target commit OIDs persisted. On startup,
+any leftover `publishing` rows are reconciled by checking whether their
+target commit is an ancestor of the branch tip (published) or not (pending
+again).
 
-Env:
-- SNAPSHOTD_QUIET_SECONDS    default 1.0
-- SNAPSHOTD_IDLE_SECONDS     default 30.0
-- SNAPSHOTD_POLL_SECONDS     default 0.35
-- SNAPSHOTD_DEBUG            enables /tmp/snapshotd-worker.log
-- SNAPSHOTD_COMMIT_MESSAGE_CMD  optional external command that reads JSON on
-                                stdin and prints a commit message on stdout.
-                                Called per prepared commit.
-- OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL  if set, used for AI commit
-                                                   messages as a fallback when
-                                                   SNAPSHOTD_COMMIT_MESSAGE_CMD
-                                                   is not set.
+Batching
+--------
+The replay keeps the index state in Python memory. Reads use one
+`git ls-files -s -z`. Writes go out as a single `git update-index -z
+--index-info` per event. Blob content for diffs is read through
+`git cat-file --batch`. AI commit messages are only generated when the
+pending backlog is shallow; otherwise deterministic messages are used.
 """
 
 from __future__ import annotations
@@ -43,6 +32,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -50,27 +40,40 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 
-DB_SUBPATH = "ai-snapshotd/snapshotd.db"
-LOCK_SUBPATH = "ai-snapshotd/worker.lock"
-INDEX_SUBPATH = "ai-snapshotd/worker.index"
+STATE_SUBDIR = "ai-snapshotd"
+DB_SUBPATH = f"{STATE_SUBDIR}/snapshotd.db"
+LOCK_SUBPATH = f"{STATE_SUBDIR}/worker.lock"
+INDEX_SUBPATH = f"{STATE_SUBDIR}/worker.index"
+LOG_SUBPATH = f"{STATE_SUBDIR}/logs/worker.log"
 
 QUIET_SECONDS = float(os.environ.get("SNAPSHOTD_QUIET_SECONDS", "1.0"))
 IDLE_SECONDS = float(os.environ.get("SNAPSHOTD_IDLE_SECONDS", "30.0"))
 POLL_SECONDS = float(os.environ.get("SNAPSHOTD_POLL_SECONDS", "0.35"))
+AI_MAX_QUEUE_DEPTH = int(os.environ.get("SNAPSHOTD_AI_MAX_QUEUE_DEPTH", "2"))
+RETENTION_SECONDS = float(os.environ.get("SNAPSHOTD_RETENTION_SECONDS", str(7 * 86400)))
+LOG_MAX_BYTES = int(os.environ.get("SNAPSHOTD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+LOG_KEEP = int(os.environ.get("SNAPSHOTD_LOG_KEEP", "3"))
 
-DEBUG_LOG = Path("/tmp/snapshotd-worker.log")
 DEBUG = os.environ.get("SNAPSHOTD_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
 COMMIT_CMD = os.environ.get("SNAPSHOTD_COMMIT_MESSAGE_CMD", "").strip()
+AI_ENABLE = os.environ.get("SNAPSHOTD_AI_ENABLE", "").lower() in {"1", "true", "yes"}
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 OPENAI_API_TIMEOUT = float(os.environ.get("OPENAI_API_TIMEOUT", "15"))
+
+SENSITIVE_PATTERNS = tuple(
+    p.strip() for p in os.environ.get(
+        "SNAPSHOTD_SENSITIVE_GLOBS",
+        ".env,.env.*,**/.env,**/.env.*,**/id_rsa*,**/*.pem,**/*.key,**/*.p12,**/*.pfx,**/secrets/*,**/credentials*",
+    ).split(",") if p.strip()
+)
 
 AI_SYSTEM_PROMPT = (
     "You are a git commit message generator.\n"
@@ -80,13 +83,36 @@ AI_SYSTEM_PROMPT = (
     "Output only the commit message."
 )
 
+_LOG_PATH: Optional[Path] = None
 
-def debug(message: str) -> None:
-    if not DEBUG:
+
+def _rotate_log(path: Path) -> None:
+    try:
+        if path.stat().st_size < LOG_MAX_BYTES:
+            return
+    except OSError:
         return
     try:
-        DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with DEBUG_LOG.open("a", encoding="utf-8") as fh:
+        for i in range(LOG_KEEP, 0, -1):
+            src = path.with_suffix(path.suffix + f".{i}")
+            dst = path.with_suffix(path.suffix + f".{i + 1}")
+            if src.exists():
+                if i == LOG_KEEP:
+                    src.unlink(missing_ok=True)
+                else:
+                    src.replace(dst)
+        path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
+
+
+def debug(message: str) -> None:
+    if not DEBUG or _LOG_PATH is None:
+        return
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_log(_LOG_PATH)
+        with _LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {message}\n")
     except Exception:
         pass
@@ -111,6 +137,17 @@ def consume_wake() -> bool:
         _wake_flag = False
         return True
     return False
+
+
+def interruptible_sleep(seconds: float) -> None:
+    deadline = time.time() + seconds
+    while True:
+        if _wake_flag:
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 class Singleton:
@@ -174,10 +211,12 @@ def maybe_git(
     repo_root: Path,
     *args: str,
     env: Optional[Dict[str, str]] = None,
+    input_bytes: Optional[bytes] = None,
 ) -> Tuple[int, str, str]:
     proc = subprocess.run(
         ["git", *args],
         cwd=str(repo_root),
+        input=input_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
@@ -203,6 +242,11 @@ def current_head(repo_root: Path) -> Optional[str]:
     return out.strip() or None
 
 
+def ref_exists(repo_root: Path, ref: str) -> bool:
+    code, _out, _err = maybe_git(repo_root, "rev-parse", "--verify", "--quiet", ref)
+    return code == 0
+
+
 def repo_special_state(git_dir: Path) -> Optional[str]:
     markers = {
         "MERGE_HEAD": "merge",
@@ -218,69 +262,135 @@ def repo_special_state(git_dir: Path) -> Optional[str]:
     return None
 
 
-def ls_tree_path(repo_root: Path, rev: str, rel: str) -> Tuple[Optional[str], Optional[str]]:
-    code, out, _ = maybe_git(repo_root, "ls-tree", rev, "--", rel)
-    if code != 0 or not out.strip():
-        return None, None
-    meta, _tab, path_part = out.splitlines()[0].partition("\t")
-    if path_part != rel:
-        return None, None
-    parts = meta.split()
-    if len(parts) < 3:
-        return None, None
-    return parts[2], parts[0]
+def is_ancestor(repo_root: Path, commit: str, descendant: str) -> bool:
+    code, _out, _err = maybe_git(
+        repo_root, "merge-base", "--is-ancestor", commit, descendant
+    )
+    return code == 0
 
 
-def index_entry(repo_root: Path, rel: str, env: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
-    code, out, _ = maybe_git(repo_root, "ls-files", "-s", "--", rel, env=env)
-    if code != 0 or not out.strip():
-        return None, None
-    first = out.splitlines()[0]
-    meta, _tab, path_part = first.partition("\t")
-    if path_part != rel:
-        return None, None
-    parts = meta.split()
-    if len(parts) < 2:
-        return None, None
-    return parts[1], parts[0]
+def read_index_state(repo_root: Path, env: Dict[str, str]) -> Dict[str, Tuple[str, str]]:
+    """Return {path: (mode, oid)} from a git index. NUL-safe."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-s", "-z"],
+        cwd=str(repo_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    out: Dict[str, Tuple[str, str]] = {}
+    if proc.returncode != 0:
+        return out
+    for chunk in proc.stdout.split(b"\x00"):
+        if not chunk:
+            continue
+        try:
+            meta_bytes, _tab, path_bytes = chunk.partition(b"\t")
+            path = path_bytes.decode("utf-8", errors="replace")
+            parts = meta_bytes.split()
+            if len(parts) < 2:
+                continue
+            mode = parts[0].decode()
+            oid = parts[1].decode()
+            out[path] = (mode, oid)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
-def apply_op_to_index(repo_root: Path, op: Dict[str, Any], env: Dict[str, str]) -> None:
-    kind = op["op"]
-    path = op["path"]
-    if kind in {"create", "modify"}:
-        run_git(
-            repo_root, "update-index", "--add", "--cacheinfo",
-            f"{op['after_mode']},{op['after_oid']},{path}",
-            env=env,
-        )
-    elif kind == "delete":
-        run_git(repo_root, "update-index", "--force-remove", "--", path, env=env)
-    elif kind == "rename":
-        old_path = op.get("old_path")
-        if old_path:
-            run_git(repo_root, "update-index", "--force-remove", "--", old_path, env=env)
-        run_git(
-            repo_root, "update-index", "--add", "--cacheinfo",
-            f"{op['after_mode']},{op['after_oid']},{path}",
-            env=env,
-        )
-    else:
-        raise RuntimeError(f"unsupported op: {kind}")
+def apply_ops_to_index(
+    repo_root: Path,
+    env: Dict[str, str],
+    ops: List[Dict[str, Any]],
+) -> None:
+    """Apply all ops for one event in a single `update-index --index-info`."""
+    chunks: List[bytes] = []
+    zero_oid = "0" * 40
+
+    def add_line(mode: str, oid: str, path: str) -> None:
+        chunks.append(f"{mode} {oid}\t{path}".encode("utf-8"))
+
+    for op in ops:
+        kind = op["op"]
+        if kind in {"create", "modify"}:
+            add_line(op["after_mode"], op["after_oid"], op["path"])
+        elif kind == "delete":
+            add_line("0", zero_oid, op["path"])
+        elif kind == "rename":
+            old_path = op.get("old_path")
+            if old_path:
+                add_line("0", zero_oid, old_path)
+            add_line(op["after_mode"], op["after_oid"], op["path"])
+    if not chunks:
+        return
+    payload = b"\x00".join(chunks) + b"\x00"
+    code, _out, err = maybe_git(
+        repo_root, "update-index", "-z", "--index-info",
+        env=env, input_bytes=payload,
+    )
+    if code != 0:
+        raise RuntimeError(f"update-index --index-info failed: {err}")
 
 
-def reconcile_live_index(repo_root: Path, paths: List[str]) -> None:
-    """After update-ref moves the branch, the live (non-worker) index still
-    reflects the old HEAD. Reset those paths in the live index so `git status`
-    is consistent. Working tree files are left untouched.
+def reconcile_live_index(
+    repo_root: Path,
+    pre_publish_head_entries: Dict[str, Tuple[str, str]],
+    paths: List[str],
+) -> None:
+    """Reset only paths whose live index entry still matches pre-publish HEAD.
+    If the user has staged something different for a touched path, skip it —
+    leave their staged state alone.
     """
     if not paths:
         return
-    # git reset [--] <paths> resets index entries to match HEAD for those paths.
-    cmd = ["reset", "-q", "--"] + sorted(set(paths))
-    code, _out, err = maybe_git(repo_root, *cmd)
+    live_env = os.environ.copy()
+    live_env.pop("GIT_INDEX_FILE", None)
+    unique = sorted(set(paths))
+    proc = subprocess.run(
+        ["git", "ls-files", "-s", "-z", "--", *unique],
+        cwd=str(repo_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=live_env,
+    )
+    if proc.returncode != 0:
+        debug("reconcile: live ls-files failed; skipping")
+        return
+    live: Dict[str, Tuple[str, str]] = {}
+    for chunk in proc.stdout.split(b"\x00"):
+        if not chunk:
+            continue
+        meta_bytes, _tab, path_bytes = chunk.partition(b"\t")
+        path = path_bytes.decode("utf-8", errors="replace")
+        parts = meta_bytes.split()
+        if len(parts) < 2:
+            continue
+        live[path] = (parts[0].decode(), parts[1].decode())
+
+    safe_paths: List[str] = []
+    for path in unique:
+        pre = pre_publish_head_entries.get(path)
+        here = live.get(path)
+        if pre is None and here is None:
+            continue
+        if pre is None and here is not None:
+            # user staged something newly; don't touch it
+            debug(f"reconcile: skip {path} (newly staged)")
+            continue
+        if pre is not None and here is None:
+            # user unstaged; reset will re-materialize HEAD entry
+            safe_paths.append(path)
+            continue
+        if pre == here:
+            safe_paths.append(path)
+        else:
+            debug(f"reconcile: skip {path} (staged diverges from HEAD)")
+
+    if not safe_paths:
+        return
+    code, _out, err = maybe_git(repo_root, "reset", "-q", "--", *safe_paths)
     if code != 0:
-        debug(f"reconcile_live_index soft-failed: {err}")
+        debug(f"reconcile reset soft-failed: {err}")
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +408,12 @@ def open_db(git_dir: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "target_commit_oid" not in existing:
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
@@ -317,6 +433,14 @@ def fetch_ops(conn: sqlite3.Connection, event_seq: int) -> List[sqlite3.Row]:
            FROM event_ops WHERE event_seq=? ORDER BY ord""",
         (event_seq,),
     ).fetchall()
+
+
+def pending_count_for_branch(conn: sqlite3.Connection, branch: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE state='pending' AND branch_ref=?",
+        (branch,),
+    ).fetchone()
+    return int(row["n"] if row else 0)
 
 
 def latest_enqueue(conn: sqlite3.Connection) -> float:
@@ -343,38 +467,108 @@ def clear_worker_state(conn: sqlite3.Connection) -> None:
         pass
 
 
-def mark_published(conn: sqlite3.Connection, seq: int, commit_oid: str) -> None:
-    conn.execute(
-        "UPDATE events SET state='published', commit_oid=?, settled_ts=? WHERE seq=?",
-        (commit_oid, time.time(), seq),
-    )
-
-
-def mark_blocked(conn: sqlite3.Connection, seq: int, reason: str) -> None:
-    conn.execute(
-        "UPDATE events SET state='blocked_conflict', error=?, settled_ts=? WHERE seq=?",
-        (reason, time.time(), seq),
-    )
-
-
-def mark_failed(conn: sqlite3.Connection, seq: int, reason: str) -> None:
-    conn.execute(
-        "UPDATE events SET state='failed', error=?, settled_ts=? WHERE seq=?",
-        (reason, time.time(), seq),
-    )
-
-
-def reset_tails_for_paths(conn: sqlite3.Connection, branch: str, paths: List[str]) -> None:
-    for path in paths:
+def reset_tails_for_paths(
+    conn: sqlite3.Connection,
+    branch: str,
+    paths_with_seqs: Iterable[Tuple[str, int]],
+) -> None:
+    """Delete path_tail entries only if they still point at the given
+    source_seq. Guards against races with newer captures."""
+    for path, seq in paths_with_seqs:
         conn.execute(
-            "DELETE FROM path_tail WHERE branch_ref=? AND path=?",
-            (branch, path),
+            "DELETE FROM path_tail WHERE branch_ref=? AND path=? AND source_seq=?",
+            (branch, path, seq),
         )
+
+
+def retention_prune(conn: sqlite3.Connection) -> None:
+    if RETENTION_SECONDS <= 0:
+        return
+    cutoff = time.time() - RETENTION_SECONDS
+    try:
+        conn.execute(
+            """DELETE FROM events
+               WHERE state IN ('published','failed','blocked_conflict')
+                 AND settled_ts IS NOT NULL AND settled_ts < ?""",
+            (cutoff,),
+        )
+    except sqlite3.OperationalError as exc:
+        debug(f"retention prune failed: {exc}")
+
+
+def cleanup_orphan_branches(conn: sqlite3.Connection, repo_root: Path) -> None:
+    """Events for branches that no longer exist will never drain."""
+    rows = conn.execute(
+        "SELECT DISTINCT branch_ref FROM events WHERE state='pending'"
+    ).fetchall()
+    for row in rows:
+        branch = row["branch_ref"]
+        if ref_exists(repo_root, branch):
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """UPDATE events SET state='blocked_conflict',
+                                     error='branch gone', settled_ts=?
+                   WHERE state='pending' AND branch_ref=?""",
+                (time.time(), branch),
+            )
+            conn.execute("DELETE FROM path_tail WHERE branch_ref=?", (branch,))
+            conn.execute("COMMIT")
+            debug(f"marked pending events on missing branch {branch} as blocked")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+
+def recover_publishing(conn: sqlite3.Connection, repo_root: Path) -> None:
+    """On startup, reconcile any leftover `publishing` events from a prior
+    worker that crashed between update-ref and settlement."""
+    rows = conn.execute(
+        """SELECT seq, branch_ref, target_commit_oid
+           FROM events WHERE state='publishing'"""
+    ).fetchall()
+    for row in rows:
+        seq = int(row["seq"])
+        branch = row["branch_ref"]
+        target = row["target_commit_oid"]
+        if not target or not ref_exists(repo_root, branch):
+            conn.execute(
+                """UPDATE events SET state='pending', target_commit_oid=NULL
+                   WHERE seq=?""",
+                (seq,),
+            )
+            continue
+        if is_ancestor(repo_root, target, branch):
+            conn.execute(
+                """UPDATE events SET state='published', commit_oid=?,
+                                     settled_ts=? WHERE seq=?""",
+                (target, time.time(), seq),
+            )
+            debug(f"recover: seq={seq} already published at {target}")
+        else:
+            conn.execute(
+                """UPDATE events SET state='pending', target_commit_oid=NULL
+                   WHERE seq=?""",
+                (seq,),
+            )
+            debug(f"recover: seq={seq} target {target} not in history; requeued")
 
 
 # --------------------------------------------------------------------------- #
 # Commit message generation
 # --------------------------------------------------------------------------- #
+
+
+def _path_matches_sensitive(path: str) -> bool:
+    from fnmatch import fnmatch
+    for pattern in SENSITIVE_PATTERNS:
+        if fnmatch(path, pattern):
+            return True
+    return False
 
 
 def decode_blob_text(data: bytes) -> Optional[str]:
@@ -383,38 +577,73 @@ def decode_blob_text(data: bytes) -> Optional[str]:
     return data.decode("utf-8", errors="replace")
 
 
-def blob_bytes(repo_root: Path, oid: Optional[str]) -> bytes:
-    if not oid:
-        return b""
-    proc = subprocess.run(
-        ["git", "cat-file", "-p", oid],
+def batch_cat_file(repo_root: Path, oids: Iterable[str]) -> Dict[str, bytes]:
+    """Resolve many blob OIDs in one `git cat-file --batch` call."""
+    unique = sorted({oid for oid in oids if oid and oid != "0" * 40})
+    if not unique:
+        return {}
+    proc = subprocess.Popen(
+        ["git", "cat-file", "--batch"],
         cwd=str(repo_root),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if proc.returncode != 0:
-        return b""
-    return proc.stdout
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        proc.stdin.write(("\n".join(unique) + "\n").encode("utf-8"))
+        proc.stdin.close()
+    except Exception:  # noqa: BLE001
+        proc.kill()
+        proc.wait(timeout=2)
+        return {}
+
+    out: Dict[str, bytes] = {}
+    try:
+        for _ in unique:
+            header = proc.stdout.readline()
+            if not header:
+                break
+            header = header.rstrip(b"\n")
+            parts = header.split(b" ")
+            if len(parts) < 3 or parts[1] != b"blob":
+                continue
+            oid = parts[0].decode()
+            size = int(parts[2])
+            data = b""
+            while len(data) < size:
+                chunk = proc.stdout.read(size - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            proc.stdout.read(1)  # trailing newline
+            out[oid] = data
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return out
 
 
-def op_diff_text(repo_root: Path, op: Dict[str, Any]) -> str:
+def op_diff_text(op: Dict[str, Any], blobs: Dict[str, bytes]) -> str:
     kind = op["op"]
     if kind == "create":
         before_label, after_label = "/dev/null", op["path"]
-        before_bytes, after_bytes = b"", blob_bytes(repo_root, op.get("after_oid"))
+        before_bytes, after_bytes = b"", blobs.get(op.get("after_oid") or "", b"")
     elif kind == "modify":
         before_label = after_label = op["path"]
-        before_bytes = blob_bytes(repo_root, op.get("before_oid"))
-        after_bytes = blob_bytes(repo_root, op.get("after_oid"))
+        before_bytes = blobs.get(op.get("before_oid") or "", b"")
+        after_bytes = blobs.get(op.get("after_oid") or "", b"")
     elif kind == "delete":
         before_label, after_label = op["path"], "/dev/null"
-        before_bytes = blob_bytes(repo_root, op.get("before_oid"))
+        before_bytes = blobs.get(op.get("before_oid") or "", b"")
         after_bytes = b""
     else:  # rename
         before_label = op.get("old_path") or op["path"]
         after_label = op["path"]
-        before_bytes = blob_bytes(repo_root, op.get("before_oid"))
-        after_bytes = blob_bytes(repo_root, op.get("after_oid"))
+        before_bytes = blobs.get(op.get("before_oid") or "", b"")
+        after_bytes = blobs.get(op.get("after_oid") or "", b"")
 
     before_text = decode_blob_text(before_bytes)
     after_text = decode_blob_text(after_bytes)
@@ -497,11 +726,18 @@ def sanitize_message(text: str) -> str:
 
 
 def ai_message_via_command(
-    repo_root: Path,
     event: sqlite3.Row,
     ops: List[Dict[str, Any]],
+    diffs: Dict[int, str],
 ) -> Optional[str]:
     if not COMMIT_CMD:
+        return None
+    try:
+        argv = shlex.split(COMMIT_CMD)
+    except ValueError as exc:
+        debug(f"bad SNAPSHOTD_COMMIT_MESSAGE_CMD: {exc}")
+        return None
+    if not argv:
         return None
     payload = {
         "seq": event["seq"],
@@ -513,47 +749,52 @@ def ai_message_via_command(
                 "op": op["op"],
                 "path": op["path"],
                 "old_path": op.get("old_path"),
-                "diff": op_diff_text(repo_root, op),
+                "diff": diffs.get(idx, ""),
             }
-            for op in ops
+            for idx, op in enumerate(ops)
         ],
     }
     try:
         proc = subprocess.run(
-            COMMIT_CMD,
-            shell=True,
+            argv,
             input=json.dumps(payload).encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=OPENAI_API_TIMEOUT,
         )
-    except subprocess.TimeoutExpired:
-        debug("commit message command timed out")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        debug(f"commit message command failed to run: {exc}")
         return None
     if proc.returncode != 0:
-        debug(f"commit message command failed: {proc.stderr.decode('utf-8','replace')[:200]}")
+        debug(f"commit message command exit {proc.returncode}")
         return None
     text = proc.stdout.decode("utf-8", errors="replace").strip()
-    if not text:
-        return None
-    return sanitize_message(text)
+    return sanitize_message(text) if text else None
 
 
 def ai_message_via_openai(
-    repo_root: Path,
     event: sqlite3.Row,
     ops: List[Dict[str, Any]],
+    diffs: Dict[int, str],
 ) -> Optional[str]:
-    if not OPENAI_API_KEY:
+    if not AI_ENABLE or not OPENAI_API_KEY:
         return None
-    diffs = "\n\n".join(
-        f"### {op['op']} {op['path']}\n{op_diff_text(repo_root, op)}" for op in ops[:5]
-    )
+    if not OPENAI_BASE_URL.lower().startswith("https://"):
+        debug("OPENAI_BASE_URL is not https; refusing to send diffs")
+        return None
+    safe_sections: List[str] = []
+    for idx, op in enumerate(ops[:5]):
+        if _path_matches_sensitive(op["path"]):
+            safe_sections.append(
+                f"### {op['op']} {op['path']}\n<redacted: sensitive path>"
+            )
+            continue
+        safe_sections.append(f"### {op['op']} {op['path']}\n{diffs.get(idx, '')}")
     user_prompt = (
         f"Tool: {event['tool_name'] or 'unknown'}\n"
         f"Branch: {event['branch_ref']}\n"
         f"Paths: {', '.join(op['path'] for op in ops)}\n\n"
-        f"Diffs:\n{diffs}\n\nGenerate the commit message."
+        f"Diffs:\n{chr(10).join(safe_sections)}\n\nGenerate the commit message."
     )
     payload = {
         "model": OPENAI_MODEL,
@@ -589,17 +830,19 @@ def ai_message_via_openai(
 
 
 def build_message(
-    repo_root: Path,
     event: sqlite3.Row,
     ops: List[Dict[str, Any]],
+    diffs: Dict[int, str],
+    use_ai: bool,
 ) -> str:
-    for provider in (ai_message_via_command, ai_message_via_openai):
-        try:
-            msg = provider(repo_root, event, ops)
-            if msg:
-                return msg
-        except Exception as exc:  # noqa: BLE001
-            debug(f"{provider.__name__} errored: {exc}")
+    if use_ai:
+        for provider in (ai_message_via_command, ai_message_via_openai):
+            try:
+                msg = provider(event, ops, diffs)
+                if msg:
+                    return msg
+            except Exception as exc:  # noqa: BLE001
+                debug(f"{provider.__name__} errored: {exc}")
     return deterministic_message(event, ops)
 
 
@@ -624,34 +867,59 @@ def ops_as_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     ]
 
 
-def verify_op_applies(
-    repo_root: Path, op: Dict[str, Any], env: Dict[str, str]
-) -> Optional[str]:
+def verify_op_applies(op: Dict[str, Any], state: Dict[str, Tuple[str, str]]) -> Optional[str]:
     kind = op["op"]
+    path = op["path"]
     if kind == "create":
-        cur_oid, _mode = index_entry(repo_root, op["path"], env)
-        if cur_oid is not None and cur_oid != op["after_oid"]:
-            return f"create target already exists with different content: {op['path']}"
+        here = state.get(path)
+        if here is not None and (here[1] != op["after_oid"] or here[0] != op["after_mode"]):
+            return f"create target already exists with different content: {path}"
         return None
     if kind == "modify":
-        cur_oid, cur_mode = index_entry(repo_root, op["path"], env)
-        if cur_oid != op["before_oid"] or cur_mode != op["before_mode"]:
-            return f"modify before-state mismatch for {op['path']}"
+        here = state.get(path)
+        expected = (op["before_mode"], op["before_oid"])
+        if here != expected:
+            return f"modify before-state mismatch for {path}"
         return None
     if kind == "delete":
-        cur_oid, _mode = index_entry(repo_root, op["path"], env)
-        if cur_oid != op["before_oid"]:
-            return f"delete before-state mismatch for {op['path']}"
+        here = state.get(path)
+        expected = (op["before_mode"], op["before_oid"])
+        if here != expected:
+            return f"delete before-state mismatch for {path}"
         return None
     if kind == "rename":
-        old_oid, old_mode = index_entry(repo_root, op["old_path"] or "", env)
-        if old_oid != op["before_oid"] or old_mode != op["before_mode"]:
-            return f"rename source mismatch for {op.get('old_path')}"
-        new_oid, _mode = index_entry(repo_root, op["path"], env)
-        if new_oid is not None:
-            return f"rename target already present: {op['path']}"
+        old = op.get("old_path") or ""
+        old_here = state.get(old)
+        expected = (op["before_mode"], op["before_oid"])
+        if old_here != expected:
+            return f"rename source mismatch for {old}"
+        if path in state:
+            return f"rename target already present: {path}"
         return None
     return f"unknown op: {kind}"
+
+
+def apply_state_op(op: Dict[str, Any], state: Dict[str, Tuple[str, str]]) -> None:
+    kind = op["op"]
+    path = op["path"]
+    if kind in {"create", "modify"}:
+        state[path] = (op["after_mode"], op["after_oid"])
+    elif kind == "delete":
+        state.pop(path, None)
+    elif kind == "rename":
+        old = op.get("old_path") or ""
+        if old:
+            state.pop(old, None)
+        state[path] = (op["after_mode"], op["after_oid"])
+
+
+def paths_touched(ops: List[Dict[str, Any]]) -> List[str]:
+    paths: List[str] = []
+    for op in ops:
+        paths.append(op["path"])
+        if op["op"] == "rename" and op.get("old_path"):
+            paths.append(op["old_path"])
+    return paths
 
 
 def replay_batch(
@@ -660,9 +928,6 @@ def replay_batch(
     git_dir: Path,
     branch: str,
 ) -> int:
-    """Replay all pending events for the branch onto current HEAD. Returns the
-    number of commits published. Returns -1 if a CAS conflict suggests retry.
-    """
     events = fetch_pending(conn, branch)
     if not events:
         return 0
@@ -677,117 +942,218 @@ def replay_batch(
         return 0
     live_branch = current_branch(repo_root)
     if live_branch != branch:
-        debug(f"branch changed from {branch} to {live_branch}; deferring this branch")
+        debug(f"worker branch {branch} != live {live_branch}; deferring")
         return 0
 
     index_file = git_dir / INDEX_SUBPATH
     index_file.parent.mkdir(parents=True, exist_ok=True)
-    if index_file.exists():
-        index_file.unlink()
     env = os.environ.copy()
     env["GIT_INDEX_FILE"] = str(index_file)
 
-    try:
-        run_git(repo_root, "read-tree", head, env=env)
-    except RuntimeError as exc:
-        debug(f"read-tree failed: {exc}")
-        return 0
-
-    commits: List[Tuple[int, str, List[Dict[str, Any]]]] = []
+    prepared: List[Tuple[int, str, List[Dict[str, Any]]]] = []
     blocked: List[Tuple[int, str, List[Dict[str, Any]]]] = []
-    failed: List[Tuple[int, str]] = []
-    parent = head
-
-    for event in events:
-        op_rows = fetch_ops(conn, event["seq"])
-        ops = ops_as_dicts(op_rows)
-        if not ops:
-            failed.append((event["seq"], "no ops"))
-            continue
-
-        reason: Optional[str] = None
-        for op in ops:
-            reason = verify_op_applies(repo_root, op, env)
-            if reason is not None:
-                break
-        if reason is not None:
-            blocked.append((event["seq"], reason, ops))
-            continue
-
-        try:
-            for op in ops:
-                apply_op_to_index(repo_root, op, env)
-            tree = run_git(repo_root, "write-tree", env=env).strip()
-            message = build_message(repo_root, event, ops)
-            commit_oid = run_git(
-                repo_root, "commit-tree", tree, "-p", parent,
-                input_bytes=message.encode("utf-8"),
-                env=env,
-            ).strip()
-        except RuntimeError as exc:
-            failed.append((event["seq"], str(exc)))
-            # Reset index back to parent for next event
-            try:
-                run_git(repo_root, "read-tree", parent, env=env)
-            except RuntimeError:
-                pass
-            continue
-
-        commits.append((event["seq"], commit_oid, ops))
-        parent = commit_oid
+    failed: List[Tuple[int, str, List[Dict[str, Any]]]] = []
+    head_state: Dict[str, Tuple[str, str]] = {}
+    final_parent = head
 
     try:
-        index_file.unlink()
-    except OSError:
-        pass
+        try:
+            index_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            run_git(repo_root, "read-tree", head, env=env)
+        except RuntimeError as exc:
+            debug(f"read-tree failed: {exc}")
+            return 0
 
-    if not commits:
+        head_state = dict(read_index_state(repo_root, env))
+        state: Dict[str, Tuple[str, str]] = dict(head_state)
+
+        backlog = pending_count_for_branch(conn, branch)
+        use_ai = backlog <= AI_MAX_QUEUE_DEPTH
+
+        all_event_ops: List[Tuple[sqlite3.Row, List[Dict[str, Any]]]] = []
+        diff_oids: List[str] = []
+        for event in events:
+            ops = ops_as_dicts(fetch_ops(conn, event["seq"]))
+            all_event_ops.append((event, ops))
+            if use_ai:
+                for op in ops:
+                    for key in ("before_oid", "after_oid"):
+                        oid = op.get(key)
+                        if oid:
+                            diff_oids.append(oid)
+
+        blobs: Dict[str, bytes] = batch_cat_file(repo_root, diff_oids) if use_ai else {}
+        parent = head
+
+        for event, ops in all_event_ops:
+            if not ops:
+                failed.append((int(event["seq"]), "no ops", []))
+                continue
+            reason: Optional[str] = None
+            for op in ops:
+                reason = verify_op_applies(op, state)
+                if reason is not None:
+                    break
+            if reason is not None:
+                blocked.append((int(event["seq"]), reason, ops))
+                continue
+
+            saved_state = dict(state)
+            for op in ops:
+                apply_state_op(op, state)
+
+            try:
+                apply_ops_to_index(repo_root, env, ops)
+                tree = run_git(repo_root, "write-tree", env=env).strip()
+                diffs = (
+                    {idx: op_diff_text(op, blobs) for idx, op in enumerate(ops)}
+                    if use_ai else {}
+                )
+                message = build_message(event, ops, diffs, use_ai=use_ai)
+                commit_oid = run_git(
+                    repo_root, "commit-tree", tree, "-p", parent,
+                    input_bytes=message.encode("utf-8"),
+                    env=env,
+                ).strip()
+            except RuntimeError as exc:
+                state = saved_state
+                failed.append((int(event["seq"]), str(exc), ops))
+                try:
+                    index_file.unlink(missing_ok=True)
+                    run_git(repo_root, "read-tree", parent, env=env)
+                    state = dict(read_index_state(repo_root, env))
+                except RuntimeError:
+                    pass
+                continue
+
+            prepared.append((int(event["seq"]), commit_oid, ops))
+            parent = commit_oid
+        final_parent = parent
+    finally:
+        try:
+            index_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if not prepared:
         if blocked or failed:
-            settle_results(conn, branch, [], blocked, failed)
+            settle_non_commit_results(conn, branch, blocked, failed)
         return 0
 
-    code, _out, err = maybe_git(repo_root, "update-ref", branch, parent, head)
+    seqs_to_publish = [seq for seq, _oid, _ops in prepared]
+
+    # Phase 1: record publishing intent.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for seq, commit_oid, _ops in prepared:
+            conn.execute(
+                """UPDATE events SET state='publishing', target_commit_oid=?
+                   WHERE seq=? AND state='pending'""",
+                (commit_oid, seq),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+    # Phase 2: move the branch.
+    code, _out, err = maybe_git(repo_root, "update-ref", branch, final_parent, head)
     if code != 0:
-        debug(f"update-ref CAS failed ({err}); will retry")
+        debug(f"update-ref CAS failed ({err}); requeuing batch")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for seq in seqs_to_publish:
+                conn.execute(
+                    """UPDATE events SET state='pending', target_commit_oid=NULL
+                       WHERE seq=? AND state='publishing'""",
+                    (seq,),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
         return -1
 
-    settle_results(conn, branch, commits, blocked, failed)
-    paths_to_reset: List[str] = []
-    for _seq, _oid, ops in commits:
-        for op in ops:
-            paths_to_reset.append(op["path"])
-            if op["op"] == "rename" and op.get("old_path"):
-                paths_to_reset.append(op["old_path"])
-    reconcile_live_index(repo_root, paths_to_reset)
-    debug(f"published {len(commits)} commit(s) to {branch}: tip={parent}")
-    return len(commits)
+    # Phase 3: settle.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        now = time.time()
+        for seq, commit_oid, _ops in prepared:
+            conn.execute(
+                """UPDATE events SET state='published', commit_oid=?,
+                                     settled_ts=? WHERE seq=?""",
+                (commit_oid, now, seq),
+            )
+        _settle_blocked_failed(conn, branch, blocked, failed, now)
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+    # Reconcile live index only where it's safe.
+    touched: List[str] = []
+    for _seq, _oid, ops in prepared:
+        for p in paths_touched(ops):
+            touched.append(p)
+    reconcile_live_index(repo_root, head_state, touched)
+    debug(f"published {len(prepared)} commit(s) to {branch}: tip={final_parent}")
+    return len(prepared)
 
 
-def settle_results(
+def _settle_blocked_failed(
     conn: sqlite3.Connection,
     branch: str,
-    commits: List[Tuple[int, str, List[Dict[str, Any]]]],
     blocked: List[Tuple[int, str, List[Dict[str, Any]]]],
-    failed: List[Tuple[int, str]],
+    failed: List[Tuple[int, str, List[Dict[str, Any]]]],
+    now: float,
+) -> None:
+    tail_invalidations: List[Tuple[str, int]] = []
+    for seq, reason, ops in blocked:
+        conn.execute(
+            """UPDATE events SET state='blocked_conflict', error=?, settled_ts=?
+               WHERE seq=?""",
+            (reason, now, seq),
+        )
+        for path in paths_touched(ops):
+            tail_invalidations.append((path, seq))
+    for seq, reason, ops in failed:
+        conn.execute(
+            """UPDATE events SET state='failed', error=?, settled_ts=?
+               WHERE seq=?""",
+            (reason, now, seq),
+        )
+        for path in paths_touched(ops):
+            tail_invalidations.append((path, seq))
+    if tail_invalidations:
+        reset_tails_for_paths(conn, branch, tail_invalidations)
+
+
+def settle_non_commit_results(
+    conn: sqlite3.Connection,
+    branch: str,
+    blocked: List[Tuple[int, str, List[Dict[str, Any]]]],
+    failed: List[Tuple[int, str, List[Dict[str, Any]]]],
 ) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for seq, commit_oid, _ops in commits:
-            mark_published(conn, seq, commit_oid)
-        blocked_paths: List[str] = []
-        for seq, reason, ops in blocked:
-            mark_blocked(conn, seq, reason)
-            for op in ops:
-                blocked_paths.append(op["path"])
-                if op["op"] == "rename" and op.get("old_path"):
-                    blocked_paths.append(op["old_path"])
-        for seq, reason in failed:
-            mark_failed(conn, seq, reason)
-        if blocked_paths:
-            reset_tails_for_paths(conn, branch, blocked_paths)
+        _settle_blocked_failed(conn, branch, blocked, failed, time.time())
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
         raise
 
 
@@ -796,54 +1162,54 @@ def settle_results(
 # --------------------------------------------------------------------------- #
 
 
-def pending_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM events WHERE state='pending'"
-    ).fetchone()
-    return int(row["n"] if row else 0)
-
-
 def worker_loop(repo_root: Path, git_dir: Path) -> int:
     conn = open_db(git_dir)
     try:
         update_heartbeat(conn, os.getpid())
+        recover_publishing(conn, repo_root)
+        cleanup_orphan_branches(conn, repo_root)
+        retention_prune(conn)
+
+        last_maint = time.time()
         idle_since: Optional[float] = None
 
         while True:
+            consume_wake()
             update_heartbeat(conn, os.getpid())
             now = time.time()
             last_enq = latest_enqueue(conn)
 
-            # Quiet-window gate: don't process until enqueues have settled.
+            if now - last_maint > 3600:
+                retention_prune(conn)
+                cleanup_orphan_branches(conn, repo_root)
+                last_maint = now
+
             if now - last_enq < QUIET_SECONDS:
-                time.sleep(POLL_SECONDS)
+                interruptible_sleep(POLL_SECONDS)
                 idle_since = None
                 continue
 
             branch = current_branch(repo_root)
             if branch is None:
-                time.sleep(POLL_SECONDS)
+                interruptible_sleep(POLL_SECONDS)
                 continue
 
             pending = fetch_pending(conn, branch)
             if not pending:
-                if pending_count(conn) == 0:
-                    if idle_since is None:
-                        idle_since = now
-                    if now - idle_since >= IDLE_SECONDS and now - last_enq >= IDLE_SECONDS:
-                        debug("idle timeout reached, exiting")
-                        return 0
-                time.sleep(POLL_SECONDS)
+                if idle_since is None:
+                    idle_since = now
+                if now - idle_since >= IDLE_SECONDS and now - last_enq >= IDLE_SECONDS:
+                    debug("idle timeout reached, exiting")
+                    return 0
+                interruptible_sleep(POLL_SECONDS)
                 continue
 
             idle_since = None
             result = replay_batch(conn, repo_root, git_dir, branch)
             if result == -1:
-                time.sleep(POLL_SECONDS)
+                interruptible_sleep(POLL_SECONDS)
                 continue
-
-            # Brief pause to batch subsequent events together.
-            time.sleep(POLL_SECONDS)
+            interruptible_sleep(POLL_SECONDS)
     finally:
         clear_worker_state(conn)
         conn.close()
@@ -863,7 +1229,7 @@ def run_worker(repo_root: Path, git_dir: Path) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Commands: status / flush
+# CLI: status / flush
 # --------------------------------------------------------------------------- #
 
 
@@ -874,7 +1240,8 @@ def cmd_status(git_dir: Path) -> int:
             state: conn.execute(
                 "SELECT COUNT(*) AS n FROM events WHERE state=?", (state,)
             ).fetchone()["n"]
-            for state in ("pending", "published", "blocked_conflict", "failed")
+            for state in ("pending", "publishing", "published",
+                          "blocked_conflict", "failed")
         }
         worker_row = conn.execute(
             "SELECT pid, heartbeat_ts, last_enqueue_ts FROM worker_state WHERE id=1"
@@ -903,13 +1270,25 @@ def cmd_flush(repo_root: Path, git_dir: Path) -> int:
     try:
         conn = open_db(git_dir)
         try:
+            recover_publishing(conn, repo_root)
             branch = current_branch(repo_root)
             if branch is None:
+                print("detached HEAD, nothing to flush", file=sys.stderr)
                 return 1
-            for _ in range(10):
+            for _ in range(20):
                 result = replay_batch(conn, repo_root, git_dir, branch)
-                if result <= 0:
+                if result == 0:
                     break
+                if result == -1:
+                    time.sleep(0.1)
+                    continue
+            remaining = pending_count_for_branch(conn, branch)
+            if remaining > 0:
+                print(
+                    f"{remaining} event(s) remain pending on {branch}",
+                    file=sys.stderr,
+                )
+                return 2
             return 0
         finally:
             conn.close()
@@ -925,6 +1304,7 @@ def resolve_git_dir(repo: Path, explicit_git_dir: Optional[Path]) -> Path:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global _LOG_PATH
     parser = argparse.ArgumentParser(description="Snapshot autocommit worker")
     parser.add_argument("--repo", required=False, help="repo path (working directory)")
     parser.add_argument("--git-dir", required=False, help="explicit git dir override")
@@ -942,6 +1322,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except RuntimeError as exc:
         print(f"not a git repository: {exc}", file=sys.stderr)
         return 1
+
+    _LOG_PATH = git_dir / LOG_SUBPATH
 
     try:
         if args.status:
