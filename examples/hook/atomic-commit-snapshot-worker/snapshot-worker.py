@@ -55,6 +55,7 @@ QUIET_SECONDS = float(os.environ.get("SNAPSHOTD_QUIET_SECONDS", "1.0"))
 IDLE_SECONDS = float(os.environ.get("SNAPSHOTD_IDLE_SECONDS", "30.0"))
 POLL_SECONDS = float(os.environ.get("SNAPSHOTD_POLL_SECONDS", "0.35"))
 AI_MAX_QUEUE_DEPTH = int(os.environ.get("SNAPSHOTD_AI_MAX_QUEUE_DEPTH", "2"))
+AI_CHUNK_SIZE = max(1, min(100, int(os.environ.get("SNAPSHOTD_AI_CHUNK_SIZE", "20"))))
 RETENTION_SECONDS = float(os.environ.get("SNAPSHOTD_RETENTION_SECONDS", str(7 * 86400)))
 LOG_MAX_BYTES = int(os.environ.get("SNAPSHOTD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 LOG_KEEP = int(os.environ.get("SNAPSHOTD_LOG_KEEP", "3"))
@@ -82,6 +83,39 @@ AI_SYSTEM_PROMPT = (
     "Describe WHAT changed and WHY. No questions, no preamble.\n"
     "Output only the commit message."
 )
+
+BATCH_SYSTEM_PROMPT = (
+    "You are a git commit message generator for a batch of snapshot events.\n"
+    "Input: one JSON payload listing events with seq, tool, paths, and diffs.\n"
+    "Output: a JSON object matching the provided schema with a 'messages'\n"
+    "array. Produce one item per input event, preserving its seq verbatim.\n"
+    "For each item:\n"
+    "- 'subject': imperative, max 50 chars, no trailing period.\n"
+    "- 'body': bullet list ('- ' prefix) describing WHAT changed and WHY,\n"
+    "  wrapped at 72 chars. One line per bullet. No preamble, no questions.\n"
+    "Do not emit any text outside the JSON object."
+)
+
+BATCH_RESPONSE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["messages"],
+    "properties": {
+        "messages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["seq", "subject", "body"],
+                "properties": {
+                    "seq": {"type": "integer"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+            },
+        },
+    },
+}
 
 _LOG_PATH: Optional[Path] = None
 
@@ -414,12 +448,18 @@ def open_db(git_dir: Path) -> sqlite3.Connection:
             conn.execute("ALTER TABLE events ADD COLUMN target_commit_oid TEXT")
         except sqlite3.OperationalError:
             pass
+    if "message" not in existing:
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN message TEXT")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
 def fetch_pending(conn: sqlite3.Connection, branch: str) -> List[sqlite3.Row]:
     return conn.execute(
-        """SELECT seq, branch_ref, base_head, session_id, tool_name, source, captured_ts
+        """SELECT seq, branch_ref, base_head, session_id, tool_name, source,
+                  captured_ts, message
            FROM events
            WHERE state='pending' AND branch_ref=?
            ORDER BY seq""",
@@ -872,20 +912,176 @@ def ai_message_via_openai(
     return sanitize_message(content)
 
 
+def _build_batch_event_payload(
+    event: sqlite3.Row,
+    ops: List[Dict[str, Any]],
+    diffs: Dict[int, str],
+) -> Dict[str, Any]:
+    """Shape one event for inclusion in a batch request, redacting any
+    op diff whose path matches a sensitive glob."""
+    op_entries: List[Dict[str, Any]] = []
+    for idx, op in enumerate(ops):
+        redact = _path_matches_sensitive(op["path"]) or (
+            op["op"] == "rename"
+            and op.get("old_path")
+            and _path_matches_sensitive(op["old_path"])
+        )
+        diff_text = (
+            "<redacted: sensitive path>" if redact else diffs.get(idx, "")
+        )
+        op_entries.append(
+            {
+                "op": op["op"],
+                "path": op["path"],
+                "old_path": op.get("old_path"),
+                "diff": diff_text,
+            }
+        )
+    return {
+        "seq": int(event["seq"]),
+        "tool_name": event["tool_name"] or "",
+        "branch_ref": event["branch_ref"],
+        "paths": [op["path"] for op in ops],
+        "ops": op_entries,
+    }
+
+
+def batch_ai_messages(
+    events_with_ops: List[Tuple[sqlite3.Row, List[Dict[str, Any]]]],
+    diffs_by_event: Dict[int, Dict[int, str]],
+) -> Dict[int, str]:
+    """Generate commit messages for a batch of events via structured output.
+
+    Chunks events into groups of ``AI_CHUNK_SIZE``, issues one POST to
+    ``{OPENAI_BASE_URL}/chat/completions`` per chunk with a json_schema
+    response format, then parses the returned ``messages`` array into a
+    ``{seq: "subject\\n\\nbody"}`` mapping (sanitized).
+
+    Returns an empty mapping for any chunk whose request or response fails
+    validation, so callers can fall back to deterministic messages for the
+    affected events.
+    """
+    if not events_with_ops:
+        return {}
+    if not AI_ENABLE or not OPENAI_API_KEY:
+        return {}
+    if not OPENAI_BASE_URL.lower().startswith("https://"):
+        debug("OPENAI_BASE_URL is not https; refusing to send diffs")
+        return {}
+
+    endpoint = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
+    out: Dict[int, str] = {}
+
+    for start in range(0, len(events_with_ops), AI_CHUNK_SIZE):
+        chunk = events_with_ops[start : start + AI_CHUNK_SIZE]
+        chunk_seqs = [int(ev["seq"]) for ev, _ops in chunk]
+        batch_events: List[Dict[str, Any]] = []
+        for event, ops in chunk:
+            diffs = diffs_by_event.get(int(event["seq"]), {})
+            batch_events.append(_build_batch_event_payload(event, ops, diffs))
+
+        user_prompt = (
+            "Generate commit messages for the following snapshot events.\n"
+            "Return one item per event, keyed by its input seq.\n\n"
+            f"{json.dumps({'events': batch_events}, ensure_ascii=False)}"
+        )
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content": BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.3,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "commit_messages",
+                    "strict": True,
+                    "schema": BATCH_RESPONSE_SCHEMA,
+                },
+            },
+        }
+        req = urllib_request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=OPENAI_API_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except (urllib_error.URLError, TimeoutError) as exc:
+            debug(f"openai batch request failed for seqs {chunk_seqs}: {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            debug(f"openai batch request errored for seqs {chunk_seqs}: {exc}")
+            continue
+
+        try:
+            parsed = json.loads(raw)
+            content = parsed["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            debug(f"openai batch response parse failed for seqs {chunk_seqs}: {exc}")
+            continue
+
+        try:
+            structured = json.loads(content)
+            items = structured["messages"]
+            if not isinstance(items, list):
+                raise ValueError("messages is not a list")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            debug(
+                f"openai batch structured output invalid for seqs "
+                f"{chunk_seqs}: {exc}"
+            )
+            continue
+
+        chunk_seq_set = set(chunk_seqs)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            seq = item.get("seq")
+            subject = item.get("subject")
+            body = item.get("body")
+            if not isinstance(seq, int) or seq not in chunk_seq_set:
+                continue
+            if not isinstance(subject, str) or not isinstance(body, str):
+                continue
+            if not subject.strip():
+                continue
+            composed = (
+                subject.strip() + "\n\n" + body.strip()
+                if body.strip()
+                else subject.strip()
+            )
+            sanitized = sanitize_message(composed)
+            if sanitized:
+                out[seq] = sanitized
+
+    return out
+
+
 def build_message(
     event: sqlite3.Row,
     ops: List[Dict[str, Any]],
     diffs: Dict[int, str],
     use_ai: bool,
+    stored_message: Optional[str] = None,
 ) -> str:
-    if use_ai:
-        for provider in (ai_message_via_command, ai_message_via_openai):
-            try:
-                msg = provider(event, ops, diffs)
-                if msg:
-                    return msg
-            except Exception as exc:  # noqa: BLE001
-                debug(f"{provider.__name__} errored: {exc}")
+    if stored_message:
+        stripped = stored_message.strip()
+        if stripped:
+            return stripped
+    if use_ai and COMMIT_CMD:
+        try:
+            msg = ai_message_via_command(event, ops, diffs)
+            if msg:
+                return msg
+        except Exception as exc:  # noqa: BLE001
+            debug(f"ai_message_via_command errored: {exc}")
     return deterministic_message(event, ops)
 
 
@@ -1029,6 +1225,57 @@ def replay_batch(
                             diff_oids.append(oid)
 
         blobs: Dict[str, bytes] = batch_cat_file(repo_root, diff_oids) if use_ai else {}
+
+        # Precompute diffs once per event so the batch AI call and the
+        # per-event commit loop can share the same text.
+        diffs_by_event: Dict[int, Dict[int, str]] = {}
+        if use_ai:
+            for event, ops in all_event_ops:
+                diffs_by_event[int(event["seq"])] = {
+                    idx: op_diff_text(op, blobs) for idx, op in enumerate(ops)
+                }
+
+        # Batched AI pre-pass: generate messages only for events whose
+        # stored message is still NULL. Persist each returned message so
+        # the commit loop (and any retried batch) reads it straight from
+        # the DB. On any per-chunk failure, the affected events simply
+        # remain NULL and will fall back to deterministic at commit time.
+        stored_messages: Dict[int, str] = {}
+        if use_ai:
+            needs_message = [
+                (event, ops)
+                for event, ops in all_event_ops
+                if not (event["message"] if "message" in event.keys() else None)
+            ]
+            # Carry forward any messages already stored from a prior attempt.
+            for event, _ops in all_event_ops:
+                existing = event["message"] if "message" in event.keys() else None
+                if existing:
+                    stored_messages[int(event["seq"])] = existing
+            if needs_message:
+                try:
+                    generated = batch_ai_messages(needs_message, diffs_by_event)
+                except Exception as exc:  # noqa: BLE001
+                    debug(f"batch_ai_messages errored: {exc}")
+                    generated = {}
+                if generated:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        for seq, message in generated.items():
+                            conn.execute(
+                                """UPDATE events SET message=?
+                                   WHERE seq=? AND state='pending'""",
+                                (message, seq),
+                            )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except sqlite3.OperationalError:
+                            pass
+                        debug("persisting batch messages failed; continuing")
+                    stored_messages.update(generated)
+
         parent = head
 
         for event, ops in all_event_ops:
@@ -1051,11 +1298,11 @@ def replay_batch(
             try:
                 apply_ops_to_index(repo_root, env, ops)
                 tree = run_git(repo_root, "write-tree", env=env).strip()
-                diffs = (
-                    {idx: op_diff_text(op, blobs) for idx, op in enumerate(ops)}
-                    if use_ai else {}
+                diffs = diffs_by_event.get(int(event["seq"]), {}) if use_ai else {}
+                stored = stored_messages.get(int(event["seq"]))
+                message = build_message(
+                    event, ops, diffs, use_ai=use_ai, stored_message=stored,
                 )
-                message = build_message(event, ops, diffs, use_ai=use_ai)
                 commit_oid = run_git(
                     repo_root, "commit-tree", tree, "-p", parent,
                     input_bytes=message.encode("utf-8"),
