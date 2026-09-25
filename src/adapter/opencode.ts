@@ -105,9 +105,6 @@ async function registerToolHooks(hooks: Hooks, context: V2Context): Promise<void
       const output = { args: payload.input }
       // The runtime signals a blocked tool call by throwing; let it propagate.
       await before({ tool: payload.tool, sessionID: payload.sessionID, callID: payload.id }, output)
-      if (output.args !== payload.input) {
-        payload.input = output.args
-      }
     })
   }
 
@@ -150,8 +147,8 @@ function startEventPump(hooks: Hooks, context: V2Context, directory: string): vo
           console.error(`[opencode-yaml-hooks] event hook failed: ${error}`)
         }
       }
-    } catch {
-      // Subscription closed (plugin unload) — stop pumping.
+    } catch (error) {
+      console.error(`[opencode-yaml-hooks] event stream ended: ${error}`)
     }
   })()
 }
