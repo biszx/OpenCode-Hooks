@@ -1,9 +1,8 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { setup } from "./adapter/opencode.js"
 
-import { createOpencodeHooksPlugin } from "./adapter/opencode.js"
-
-const OpencodeHooksPlugin: Plugin = async (input) => {
-  return createOpencodeHooksPlugin(input)
+const OpencodeHooksPlugin = {
+  id: "opencode-yaml-hooks",
+  setup,
 }
 
 export default OpencodeHooksPlugin

@@ -6,6 +6,8 @@ Use it to run tests after edits, lint changed files, block risky commands before
 
 ## Install
 
+Requires OpenCode v2 (plugin API `{ id, setup }`).
+
 Install from npm with Bun:
 
 ```bash
