@@ -1,6 +1,6 @@
 {
   "name": "opencode-yaml-hooks",
-  "version": "2026.9.25",
+  "version": "2026.3.29",
   "description": "OpenCode plugin for running command, tool, and bash hooks from hooks.yaml during session and tool lifecycle events.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target bun --format esm && tsc -p tsconfig.json --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outfile dist/index.js --target bun --format esm && tsc -p tsconfig.json --emitDeclarationOnly",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },

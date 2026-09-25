@@ -6,7 +6,7 @@ Use it to run tests after edits, lint changed files, block risky commands before
 
 ## Install
 
-Requires OpenCode v2 (plugin API `{ id, setup }`). Versions up to `2026.3.29` target the older v1 plugin API.
+Requires OpenCode v2 (plugin API `{ id, setup }`).
 
 Install from npm with Bun:
 
